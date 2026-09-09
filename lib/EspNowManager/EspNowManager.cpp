@@ -22,6 +22,11 @@ constexpr UBaseType_t kTxQueueDepth[kTxPriorityCount] = {
 constexpr std::uint8_t kNoCompletionSlot = 0xFFU;
 constexpr std::size_t kCompletionSlotCount = 4U;
 constexpr std::uint32_t kAsyncCallbackTimeoutMs = 250U;
+// ESP-NOW callbacks normally arrive before the caller's timeout.  If one does
+// not, wait briefly for a genuinely late callback so it cannot be mistaken for
+// the next frame, but never wait forever: an absent robot/driver callback used
+// to park the only TX worker until the dongle was rebooted.
+constexpr std::uint32_t kLateCallbackGraceMs = 500U;
 
 // Standard 802.11 MAC header: frame control at offset 0-1, then three 6-byte
 // address fields for a management frame at offsets 4, 10, 16. Address2 (10)
@@ -179,19 +184,27 @@ void txWorker(void*) {
             completeRequest(request, false, false);
 
             // ESP-NOW does not carry an application token in its callback.
-            // Starting another send now would let this late callback satisfy
-            // a newer request to the same MAC. Keep only the TX worker
-            // quarantined until the outstanding callback arrives; producers
-            // and the main loop remain responsive and their bounded queues
-            // expose backpressure instead of corrupting correlation.
-            while (g_txWorkerRunning) {
+            // Give a late callback a short chance to arrive before reusing the
+            // status queue, then discard anything stale and resume. An
+            // unbounded quarantine here made one missing callback permanently
+            // stop heartbeat, manifest and relay traffic.
+            const std::uint32_t graceStartedMs = millis();
+            while (g_txWorkerRunning &&
+                   (millis() - graceStartedMs) < kLateCallbackGraceMs) {
                 DriverStatus late{};
-                if (xQueueReceive(g_driverStatusQueue, &late, pdMS_TO_TICKS(250U)) == pdTRUE &&
+                const std::uint32_t elapsedGrace = millis() - graceStartedMs;
+                const std::uint32_t remainingGrace = kLateCallbackGraceMs - elapsedGrace;
+                if (xQueueReceive(g_driverStatusQueue, &late,
+                                  pdMS_TO_TICKS(remainingGrace > 0U ? remainingGrace : 1U)) == pdTRUE &&
                     std::memcmp(late.mac, request.mac, sizeof(request.mac)) == 0) {
                     ++g_txCallbacksReceived;
                     break;
                 }
             }
+            // The late callback queue has no correlation token. Clearing it is
+            // safer than letting an old result satisfy a future request after
+            // the bounded recovery window.
+            xQueueReset(g_driverStatusQueue);
             continue;
         }
         completeRequest(request, callbackReceived, delivered);

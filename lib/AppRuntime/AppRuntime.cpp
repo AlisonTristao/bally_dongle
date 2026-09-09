@@ -44,12 +44,12 @@ constexpr uint32_t kWarnThrottleMs = 5000U;
 // o dongle autenticou um frame de administracao canal C/AEAD-L nos ultimos
 // kPeerOnlineWindowMs. Trafego endpoint B continua sendo relayado opaco, mas
 // nao cria identidade nem renova presenca. Um robo vivo manda STATUS C a cada
-// ~500ms (bally_OS kStatusPeriodUs); 4s tolera varias perdas seguidas de
-// STATUS (a RF perto dos motores derruba frames) sem deixar a bolinha piscar,
-// e ainda respeita o criterio "offline <=4s" da fase 5. A transicao para
+// ~500ms (bally_OS kStatusPeriodUs); 1,5 s tolera dois STATUS consecutivos
+// perdidos (a RF perto dos motores derruba frames), mas nao deixa um robo
+// desligado parecer conectado por varios segundos. A transicao para
 // offline e publicada sozinha: peersFingerprint() inclui "online", e
 // DonglePublisher publica hub.peers on-change (fase 2.C, sem codigo extra).
-constexpr uint32_t kPeerOnlineWindowMs = 4000U;
+constexpr uint32_t kPeerOnlineWindowMs = 1500U;
 
 // Same POSIX timezone used by bally_OS's default RobotSettings. The system
 // clock itself is Unix epoch/UTC; this only defines how manual set_clock
