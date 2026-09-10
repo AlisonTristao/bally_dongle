@@ -1165,9 +1165,14 @@ void pingTick() {
     // the frame has to be the exact one notePingSent records: sendLogical
     // reserves its own internally and never reports it back, which would
     // leave the pending record correlated against the wrong number and the
-    // reply never matching. A fixed 20-octet ping payload always fits one
-    // frame, same as heartbeatTick's STATUS probe.
-    uint8_t frame[btp::kV1MinimumFrameSize + BtpTransport::kAeadTagSize];
+    // reply never matching. Unlike heartbeatTick's STATUS probe (empty
+    // payload), a ping carries the 20-octet kRequestPrefixSize payload, so
+    // the buffer has to cover that on top of the header+CRC floor and the
+    // AEAD tag -- sizing it like STATUS's silently made encodeSingleFrame
+    // fail closed (BufferTooSmall) on every call, so pingTick() returned
+    // before notePingSent() ever ran and hub.peers' rtt_ms/ping fields never
+    // populated.
+    uint8_t frame[btp::kV1MinimumFrameSize + sizeof(payload) + BtpTransport::kAeadTagSize];
     size_t frameSize = 0;
     if (!BtpTransport::encodeSingleFrame(btp::MessageType::Command,
                                          BtpTransport::btp_command::kCommandRequestObjectId,
