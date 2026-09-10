@@ -300,16 +300,23 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
     }
 
     const BaseType_t workerCore = selectEspNowWorkerCore();
-    // 10240, not the original 6144: processRxDatagram -> RadioSeal::open ->
+    // 12288, up from 10240: processRxDatagram -> RadioSeal::open ->
     // btp::aead_open_aes_gcm puts an mbedtls_gcm_context plus a
-    // RoutedMessage (payload[616]) and a plaintext[616] on this task's
-    // stack. 6144 predates the channel-C AEAD work (topicos 28-31) and is
-    // below Espressif's ~8 KB guidance for a task that touches mbedtls --
-    // one of the suspects for the boot-time reset loop.
+    // RoutedMessage and a plaintext[] on this task's stack, both now sized
+    // to ProtocolRouter::kMaxPayloadSize (2000, up from 616 -- wide enough
+    // for CONTROL/MANIFEST_DATA's reassembled catalog, see that constant's
+    // own comment for the manifest-capacity fix this was part of), a
+    // combined +2.7 KB over the 616-sized pair the original 10240 was sized
+    // against. 10240 itself replaced an original 6144: that predates the
+    // channel-C AEAD work (topicos 28-31) and was below Espressif's ~8 KB
+    // guidance for a task that touches mbedtls -- one of the suspects for
+    // the boot-time reset loop. Kept generous rather than the exact delta,
+    // same margin-over-the-precise-number this task's stack has followed
+    // both times before.
     const BaseType_t rxTaskOk = xTaskCreatePinnedToCore(
         espNowRxWorkerTask,
         "espnow_rx",
-        10240,
+        12288,
         nullptr,
         2,
         &espNowRxTaskHandle_,

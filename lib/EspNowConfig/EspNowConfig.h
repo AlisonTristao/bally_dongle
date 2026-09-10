@@ -11,12 +11,22 @@ class LcdDashboard;
 #define RX_ASYNC_QUEUE_DEPTH 24
 #endif
 
-// Each slot of these two queues is a ProtocolRouter::RoutedMessage, which
-// carries a payload[kMaxPayloadSize=616] buffer -- ~680 B/slot. 32 slots
-// each was ~44 KB of heap for the pair, reserved up front in
+// Each slot of these three queues is a QueuedRoutedMessage (EspNowConfig.cpp),
+// not a ProtocolRouter::RoutedMessage: it carries its own, deliberately
+// smaller payload[kQueuedPayloadCap=616] buffer, capped well under
+// ProtocolRouter::kMaxPayloadSize (2000, sized for CONTROL/MANIFEST_DATA's
+// much larger reassembled catalog) so that ceiling is never paid
+// RX_LOG/TELEMETRY/TERMINAL_QUEUE_DEPTH times over -- ~680 B/slot either way.
+// 32 slots each was ~44 KB of heap for the pair, reserved up front in
 // enableAsyncRx() during a boot sequence that was already running out of
 // internal RAM (topico 33 / topico 34 section 1B). 16 is still four beats
 // of burst headroom at the main loop's drain rate.
+//
+// CONTROL has no queue of its own any more (RX_CONTROL_QUEUE_DEPTH removed):
+// it is dispatched synchronously in dispatchRouted(), same as COMMAND below,
+// specifically so a queue never has to hold ProtocolRouter::RoutedMessage's
+// full 2000-octet payload -- see ProtocolRouter::kMaxPayloadSize's own
+// comment for the manifest-capacity bug this was fixing.
 #ifndef RX_LOG_QUEUE_DEPTH
 #define RX_LOG_QUEUE_DEPTH 16
 #endif
@@ -27,10 +37,6 @@ class LcdDashboard;
 
 #ifndef RX_TERMINAL_QUEUE_DEPTH
 #define RX_TERMINAL_QUEUE_DEPTH 16
-#endif
-
-#ifndef RX_CONTROL_QUEUE_DEPTH
-#define RX_CONTROL_QUEUE_DEPTH 8
 #endif
 
 #ifndef RX_COMMAND_QUEUE_DEPTH
@@ -89,23 +95,28 @@ bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs = 0);
  *
  * Everything while the port is still console-owned (no client to relay to)
  * also takes the pre-hub path: decode + reassemble via ProtocolRouter, then
- * dispatch -- COMMAND synchronously here
- * (remote execution shouldn't wait for the next drainRoutedQueues() call),
- * LOG/TELEMETRY/TERMINAL/CONTROL into their own bounded queue.
+ * dispatch -- COMMAND and CONTROL synchronously here (remote execution
+ * shouldn't wait for the next drainRoutedQueues() call, and CONTROL/
+ * MANIFEST_DATA would otherwise force a queue to hold ProtocolRouter::
+ * RoutedMessage's full, manifest-sized payload -- see ProtocolRouter::
+ * kMaxPayloadSize's own comment), LOG/TELEMETRY/TERMINAL into their own
+ * bounded queue.
  */
 void processRxDatagram(const RxDatagramEvent& event);
 
 /**
- * @brief Drains up to maxItemsPerQueue entries from each of the CONTROL/LOG/
+ * @brief Drains up to maxItemsPerQueue entries from each of the LOG/
  * TELEMETRY/TERMINAL queues, in that priority order.
  *
  * Since topico 28 these queues only ever see what the dongle consumes, plus
  * everything at all while the port is console-owned: with a client attached,
  * the rest is relayed straight off the radio and never routed. LOG is printed
- * to the console (source_id-tagged); CONTROL/MANIFEST_DATA feeds
- * ManifestCache; TELEMETRY and TERMINAL are drained and discarded on this
- * path, since their only real consumer is the relay.
- * @return total entries drained across all four queues.
+ * to the console (source_id-tagged); TELEMETRY and TERMINAL are drained and
+ * discarded on this path, since their only real consumer is the relay.
+ * CONTROL/MANIFEST_DATA is not among these any more -- it feeds ManifestCache
+ * synchronously from dispatchRouted() instead (see processRxDatagram's own
+ * comment).
+ * @return total entries drained across all three queues.
  */
 size_t drainRoutedQueues(size_t maxItemsPerQueue = 8);
 

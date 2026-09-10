@@ -26,18 +26,39 @@
  */
 namespace ProtocolRouter {
 
-// Bounded to BtpTransport::kMaxLogicalPayloadSize's max real user, a
-// fragmented COMMAND_REQUEST (20-byte prefix + up to 512 shell bytes), PLUS
-// btp::aead's 16-octet tag: everything this router reassembles is channel C
-// (dongle<->robot, key L) as of topico 30, so a message sealed at
-// BtpTransport::kMaxLogicalPayloadSize (600) is 616 octets on the wire, and
-// this buffer has to hold that whole, still-sealed message before
-// RadioSeal::open() gets a chance to shrink it back down -- opening happens
-// AFTER reassembly, never before (BTP/docs/encryption.md section 6). No real
-// caller sends a 600-octet plaintext today (532 is the largest, a full-size
-// shell command), but the ceiling is meant to be an honest upper bound, not
-// one that only happens to work for today's traffic.
-constexpr std::size_t kMaxPayloadSize = 616U;
+// Bounded to the larger of this router's two candidate message types
+// (bally_channels.h's dongle_may_consume: COMMAND and CONTROL/MANIFEST_DATA),
+// sealed, PLUS btp::aead's 16-octet tag -- everything this router reassembles
+// is channel C (dongle<->robot, key L) as of topico 30, and RadioSeal::open()
+// only gets a chance to shrink a message back down AFTER reassembly, never
+// before (BTP/docs/encryption.md section 6).
+//
+// COMMAND alone would only need 616 (BtpTransport::kMaxLogicalPayloadSize's
+// 600-octet ceiling, a fragmented COMMAND_REQUEST -- 20-byte prefix + up to
+// 512 shell bytes -- plus the tag; no real caller sends more than 532 today).
+// CONTROL/MANIFEST_DATA is the actual driver of this ceiling: a robot's whole
+// catalog (bally_OS's ManifestCatalog, one MANIFEST_DATA per enumeration
+// index) measured 1710 plaintext octets once robot.sensors/robot.flags
+// existed (BTP/docs/commands.md section 3's format-2 header + source_info
+// block + every topic/field record), 1726 sealed -- and this ceiling used to
+// sit at 616, so every fragment of that manifest was rejected before
+// reassembly even started (retainPendingRelay() in EspNowConfig.cpp checking
+// header.fragment_count against kPendingRelayMaxFragments, itself derived
+// from this constant): the robot's catalog never reached ManifestCache, so
+// it never appeared in TraceView, with nothing on the wire (STATUS/terminal/
+// telemetry, all single-frame or small) hinting why. 2000 matches
+// bally_OS's own kMaxManifestScratchBytes ceiling (1900 plaintext + 16 tag =
+// 1916) with a little headroom of this router's own, so a manifest that
+// grows right up to bally_OS's declared limit still fits here -- an honest
+// upper bound for both message types, not one sized to only today's traffic
+// (see this repo's topico on the manifest-capacity fix for the full
+// analysis). Kept out of ProtocolRouter::RoutedMessage's per-queue-item cost
+// deliberately: CONTROL is dispatched synchronously in EspNowConfig.cpp,
+// same as COMMAND, specifically so this larger ceiling is never paid
+// RX_LOG/TELEMETRY/TERMINAL_QUEUE_DEPTH times over by message types that
+// never come close to needing it (those three queues copy into their own,
+// still-616-sized QueuedRoutedMessage).
+constexpr std::size_t kMaxPayloadSize = 2000U;
 constexpr std::size_t kSlotCount = 4U;
 constexpr std::uint64_t kReassemblyTimeoutMs = 4000U;
 

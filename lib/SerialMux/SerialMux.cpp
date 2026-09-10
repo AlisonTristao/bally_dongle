@@ -84,7 +84,13 @@ struct QueuedFrame {
 
 // Per-class heap budget for the four TX queues. Only kTelemetry is
 // bounded-small by construction: one ESP-NOW-profile sample (<=250 payload)
-// or a reassembled robot sample (<= ProtocolRouter::kMaxPayloadSize, 616).
+// or a reassembled robot sample -- capped at EspNowConfig.cpp's own
+// kQueuedPayloadCap (616), NOT ProtocolRouter::kMaxPayloadSize (2000 as of
+// the manifest-capacity fix, sized for CONTROL/MANIFEST_DATA's reassembled
+// catalog): EspNowConfig::handleTelemetryItem() only ever sees a
+// QueuedRoutedMessage, which copies down to that smaller ceiling before this
+// queue's producer (SerialMux::forwardRelay) ever runs -- MANIFEST_DATA
+// itself is dispatched synchronously now and never reaches here at all.
 // The other three can each legitimately hold a kOutboundPayloadCap-sized
 // frame -- a chunked COMMAND_RESULT, a chunked TERMINAL_OUT, a MANIFEST_DATA
 // descriptor or a long LOG line -- so they keep the full slot.

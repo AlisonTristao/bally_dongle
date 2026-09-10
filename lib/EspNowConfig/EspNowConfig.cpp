@@ -125,11 +125,32 @@ bool retainPendingRelay(const btp::Header& header, const std::uint8_t* data, std
     return true;
 }
 
+// The LOG/TELEMETRY/TERMINAL queues' own item type -- deliberately NOT
+// ProtocolRouter::RoutedMessage. That type's payload[] is sized to
+// ProtocolRouter::kMaxPayloadSize (2000, wide enough for CONTROL/
+// MANIFEST_DATA's reassembled catalog -- see that constant's own comment),
+// and multiplying that by three 16-deep queues would cost ~66 KB of heap for
+// message types that never come close to needing it. CONTROL is dispatched
+// synchronously instead (dispatchRouted(), mirroring COMMAND) and never
+// queues at all, so only these three types' own, much smaller ceiling has to
+// pay a per-queue-item cost. kQueuedPayloadCap keeps ProtocolRouter's OLD
+// ceiling (616, itself sized for COMMAND's up to 532-byte shell text, which
+// was never queued either) -- comfortably larger than any real LOG/
+// TELEMETRY/TERMINAL payload.
+constexpr std::size_t kQueuedPayloadCap = 616U;
+
+struct QueuedRoutedMessage {
+    std::uint8_t mac[6];
+    btp::Header header;
+    std::uint8_t payload[kQueuedPayloadCap];
+    std::size_t payloadSize;
+    std::uint64_t arrivalMs;
+};
+
 QueueHandle_t g_rxQueue = nullptr;
 QueueHandle_t g_logQueue = nullptr;
 QueueHandle_t g_telemetryQueue = nullptr;
 QueueHandle_t g_terminalQueue = nullptr;
-QueueHandle_t g_controlQueue = nullptr;
 
 // Cumulative counters, never cleared by a read. The takeDropped*Count()
 // accessors below keep their original "delta since my last call" contract by
@@ -281,7 +302,7 @@ const char* robotStateName(uint8_t value) {
 // strip. Any structural mismatch (wrong schema version, short payload, a
 // field that fails to decode) is silently ignored -- a bad sample here must
 // never crash or block the raw relay that always runs alongside this.
-void handleRobotStateTelemetry(const ProtocolRouter::RoutedMessage& routed) {
+void handleRobotStateTelemetry(const QueuedRoutedMessage& routed) {
     if (g_lcdDashboard == nullptr) {
         return;
     }
@@ -314,7 +335,7 @@ void macToText(const uint8_t mac[6], char out[18]) {
 
 // Copies a routed payload into a NUL-terminated stack buffer for display
 // purposes only (routing itself already preserved the full byte range).
-size_t copyPayloadAsText(const ProtocolRouter::RoutedMessage& routed, char* out, size_t outCapacity) {
+size_t copyPayloadAsText(const QueuedRoutedMessage& routed, char* out, size_t outCapacity) {
     if (out == nullptr || outCapacity == 0) {
         return 0;
     }
@@ -332,19 +353,44 @@ QueueHandle_t queueForType(btp::MessageType type) {
         case btp::MessageType::Log: return g_logQueue;
         case btp::MessageType::Telemetry: return g_telemetryQueue;
         case btp::MessageType::Terminal: return g_terminalQueue;
-        case btp::MessageType::Control: return g_controlQueue;
+        // CONTROL is dispatched synchronously from dispatchRouted() now
+        // (handleControlItem(), mirroring COMMAND below) and never reaches
+        // this function at all -- see ProtocolRouter::kMaxPayloadSize's own
+        // comment for why it no longer has a queue of its own.
+        case btp::MessageType::Control:
         case btp::MessageType::Command:
         case btp::MessageType::Invalid:
         default: return nullptr;
     }
 }
 
+// Copies the freshly-reassembled ProtocolRouter::RoutedMessage (sized to
+// ProtocolRouter::kMaxPayloadSize, 2000 -- wide enough for CONTROL/
+// MANIFEST_DATA, which never reaches this function; see queueForType())
+// down into this queue's own, smaller QueuedRoutedMessage. LOG/TELEMETRY/
+// TERMINAL are never expected to approach kQueuedPayloadCap (616, itself
+// COMMAND's old ceiling, and COMMAND is never queued either), but the
+// console-owned fallback in processRxDatagramInternal runs every message
+// type through the same shared reassembler, so a payload too big for this
+// queue's item type is possible in principle and must be dropped+counted,
+// never silently truncated.
 bool enqueueRouted(QueueHandle_t queue, const ProtocolRouter::RoutedMessage& routed) {
     if (queue == nullptr) {
         return false;
     }
+    if (routed.payloadSize > kQueuedPayloadCap) {
+        ++g_droppedQueueFullTotal;
+        return false;
+    }
 
-    if (xQueueSend(queue, &routed, 0) == pdTRUE) {
+    QueuedRoutedMessage item{};
+    std::memcpy(item.mac, routed.mac, sizeof(item.mac));
+    item.header = routed.header;
+    std::memcpy(item.payload, routed.payload, routed.payloadSize);
+    item.payloadSize = routed.payloadSize;
+    item.arrivalMs = routed.arrivalMs;
+
+    if (xQueueSend(queue, &item, 0) == pdTRUE) {
         return true;
     }
 
@@ -555,6 +601,29 @@ std::uint32_t referenceSourceId(const btp::Header& header, const std::uint8_t* p
     return hasReference && plaintext != nullptr && plaintextSize >= 4U ? readU32Le(plaintext) : 0U;
 }
 
+// A robot answering a MANIFEST_REQUEST this dongle sent it (topico 16), or
+// (console-owned fallback only) some other CONTROL object_id this dongle has
+// no handler for. Two distinct paths reach here through dispatchRouted(),
+// not one: a genuine MANIFEST_DATA that opened under key L and passed
+// bally::dongle_consumes() arrives regardless of console/protocolled state
+// (that check has nothing to do with port ownership); any OTHER CONTROL
+// object_id only reaches here via the console-owned fallback, since with a
+// desktop attached it is relayed upstream instead (mayConsume was false for
+// it) and never routed at all.
+void handleControlItem(const ProtocolRouter::RoutedMessage& routed) {
+    if (routed.header.object_id == ManifestCache::kManifestDataObjectId) {
+        ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
+        return;
+    }
+    // SUBSCRIBE_RESULT/UNSUBSCRIBE_RESULT used to be folded into
+    // SubscriptionRegistry here, correlating the upstream request this dongle
+    // had merged on its clients' behalf. Topico 28 removed that: a robot's
+    // subscriptions are channel B now -- TraceView subscribes at the robot
+    // and the robot arbitrates per session -- so the dongle neither asks nor
+    // has anything to correlate, and the answer belongs to the client, which
+    // gets it verbatim through the relay.
+}
+
 void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
     countRouted(routed.header.type);
 
@@ -562,6 +631,19 @@ void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& r
         // Latency sensitive (remote shell execution): handled synchronously,
         // not queued -- see EspNowConfig.h for the rationale.
         handleRoutedCommand(mac, routed);
+        return;
+    }
+
+    if (routed.header.type == btp::MessageType::Control) {
+        // Also synchronous, same reasoning as COMMAND above plus one more:
+        // routed.payload can be up to ProtocolRouter::kMaxPayloadSize (2000,
+        // sized for MANIFEST_DATA's reassembled catalog -- see that
+        // constant's own comment), and every OTHER routed type's queue item
+        // is deliberately capped much smaller (QueuedRoutedMessage's
+        // kQueuedPayloadCap, 616) specifically so that larger ceiling is
+        // never paid per-queue-slot by message types that never approach
+        // it. There is no CONTROL queue to enqueue into any more.
+        handleControlItem(routed);
         return;
     }
 
@@ -749,12 +831,12 @@ void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
     (void)status;
 }
 
-size_t drainOneQueue(QueueHandle_t queue, size_t maxItems, void (*handler)(const ProtocolRouter::RoutedMessage&)) {
+size_t drainOneQueue(QueueHandle_t queue, size_t maxItems, void (*handler)(const QueuedRoutedMessage&)) {
     if (queue == nullptr || maxItems == 0) {
         return 0;
     }
 
-    ProtocolRouter::RoutedMessage item{};
+    QueuedRoutedMessage item{};
     size_t drained = 0;
     while (drained < maxItems && xQueueReceive(queue, &item, 0) == pdTRUE) {
         handler(item);
@@ -763,8 +845,11 @@ size_t drainOneQueue(QueueHandle_t queue, size_t maxItems, void (*handler)(const
     return drained;
 }
 
-void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
-    char text[ProtocolRouter::kMaxPayloadSize + 1] = {0};
+void handleLogItem(const QueuedRoutedMessage& routed) {
+    // Sized to this queue's own kQueuedPayloadCap, not ProtocolRouter::
+    // kMaxPayloadSize (2000, CONTROL/MANIFEST_DATA's ceiling -- LOG never
+    // reaches anywhere near that; see QueuedRoutedMessage's own comment).
+    char text[kQueuedPayloadCap + 1] = {0};
     copyPayloadAsText(routed, text, sizeof(text));
 
     // Plain human console: unchanged behavior, print as before. Protocolled
@@ -788,7 +873,7 @@ void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
 // to a protocolled desktop session. With no session attached, forwardRelay()
 // is a no-op (counted, not queued) -- same net effect as topico 12's
 // drain-and-discard placeholder.
-void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
+void handleTelemetryItem(const QueuedRoutedMessage& routed) {
     if (routed.header.object_id == kRobotStateTopicId) {
         handleRobotStateTelemetry(routed);
     }
@@ -802,25 +887,7 @@ void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
 // off the radio and never reaches this queue while a client is attached; what
 // is left here only runs with the port console-owned, where a robot's
 // terminal stream has no reader by definition.
-void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}
-
-// A robot answering a MANIFEST_REQUEST this dongle sent it (topico 16). Only
-// reachable on the console-owned fallback path since topico 28 -- with a
-// desktop attached, CONTROL that is not on bally::dongle_consumes' list is
-// relayed and never routed. Any other CONTROL object_id is ignored.
-void handleControlItem(const ProtocolRouter::RoutedMessage& routed) {
-    if (routed.header.object_id == ManifestCache::kManifestDataObjectId) {
-        ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
-        return;
-    }
-    // SUBSCRIBE_RESULT/UNSUBSCRIBE_RESULT used to be folded into
-    // SubscriptionRegistry here, correlating the upstream request this dongle
-    // had merged on its clients' behalf. Topico 28 removed that: a robot's
-    // subscriptions are channel B now -- TraceView subscribes at the robot
-    // and the robot arbitrates per session -- so the dongle neither asks nor
-    // has anything to correlate, and the answer belongs to the client, which
-    // gets it verbatim through the relay.
-}
+void handleTerminalItem(const QueuedRoutedMessage&) {}
 
 } // namespace
 
@@ -844,20 +911,17 @@ bool enableAsyncRx(size_t queueDepth) {
         g_rxQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth), sizeof(RxDatagramEvent));
     }
     if (g_logQueue == nullptr) {
-        g_logQueue = xQueueCreate(static_cast<UBaseType_t>(RX_LOG_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+        g_logQueue = xQueueCreate(static_cast<UBaseType_t>(RX_LOG_QUEUE_DEPTH), sizeof(QueuedRoutedMessage));
     }
     if (g_telemetryQueue == nullptr) {
-        g_telemetryQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TELEMETRY_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+        g_telemetryQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TELEMETRY_QUEUE_DEPTH), sizeof(QueuedRoutedMessage));
     }
     if (g_terminalQueue == nullptr) {
-        g_terminalQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TERMINAL_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
-    }
-    if (g_controlQueue == nullptr) {
-        g_controlQueue = xQueueCreate(static_cast<UBaseType_t>(RX_CONTROL_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+        g_terminalQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TERMINAL_QUEUE_DEPTH), sizeof(QueuedRoutedMessage));
     }
 
     if (g_rxQueue == nullptr || g_logQueue == nullptr || g_telemetryQueue == nullptr ||
-        g_terminalQueue == nullptr || g_controlQueue == nullptr) {
+        g_terminalQueue == nullptr) {
         g_asyncRxEnabled = false;
         return false;
     }
@@ -866,7 +930,6 @@ bool enableAsyncRx(size_t queueDepth) {
     xQueueReset(g_logQueue);
     xQueueReset(g_telemetryQueue);
     xQueueReset(g_terminalQueue);
-    xQueueReset(g_controlQueue);
     // Totals and their watermarks are cleared together, so the deltas
     // takeDropped*Count() reports stay consistent across the reset.
     g_droppedRxTotal = 0;
@@ -898,7 +961,6 @@ void disableAsyncRx() {
     if (g_logQueue != nullptr) xQueueReset(g_logQueue);
     if (g_telemetryQueue != nullptr) xQueueReset(g_telemetryQueue);
     if (g_terminalQueue != nullptr) xQueueReset(g_terminalQueue);
-    if (g_controlQueue != nullptr) xQueueReset(g_controlQueue);
 }
 
 bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs) {
@@ -915,8 +977,10 @@ void processRxDatagram(const RxDatagramEvent& event) {
 }
 
 size_t drainRoutedQueues(size_t maxItemsPerQueue) {
+    // CONTROL/MANIFEST_DATA is not among these any more -- dispatchRouted()
+    // feeds ManifestCache synchronously via handleControlItem() instead (see
+    // ProtocolRouter::kMaxPayloadSize's own comment for why).
     size_t total = 0;
-    total += drainOneQueue(g_controlQueue, maxItemsPerQueue, handleControlItem);
     total += drainOneQueue(g_logQueue, maxItemsPerQueue, handleLogItem);
     total += drainOneQueue(g_telemetryQueue, maxItemsPerQueue, handleTelemetryItem);
     total += drainOneQueue(g_terminalQueue, maxItemsPerQueue, handleTerminalItem);
