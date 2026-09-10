@@ -21,12 +21,30 @@ constexpr UBaseType_t kTxQueueDepth[kTxPriorityCount] = {
 };
 constexpr std::uint8_t kNoCompletionSlot = 0xFFU;
 constexpr std::size_t kCompletionSlotCount = 4U;
-constexpr std::uint32_t kAsyncCallbackTimeoutMs = 250U;
+// 60 ms, down from 250: this is the per-frame budget the single TX worker
+// waits for an ordinary fire-and-forget send's callback (sendToMac --
+// relay, MANIFEST_DATA replies, LOG, COMMAND_RESULT, manifest priming --
+// the bulk of this dongle's radio output) before giving up and moving to
+// the next queued frame. Same reasoning bally_OS's TxScheduler::configure()
+// already applies to its own delivery timeout: "a callback that has not
+// arrived in N ms is not going to change the outcome; the frame was
+// already handed to the driver". At 250 ms, a single missing/late callback
+// (RF noise near the motors) stalled every other frame behind it in this
+// worker's queues for a quarter second each; near-continuous loss collapsed
+// heartbeat, manifest priming and relay to a crawl even after the
+// unbounded-quarantine bug below was fixed.
+constexpr std::uint32_t kAsyncCallbackTimeoutMs = 60U;
 // ESP-NOW callbacks normally arrive before the caller's timeout.  If one does
 // not, wait briefly for a genuinely late callback so it cannot be mistaken for
 // the next frame, but never wait forever: an absent robot/driver callback used
 // to park the only TX worker until the dongle was rebooted.
-constexpr std::uint32_t kLateCallbackGraceMs = 500U;
+//
+// 100 ms, down from 500: this grace only needs to outlast a callback that is
+// late but still coming, not absorb a whole missing one -- kAsyncCallbackTimeoutMs
+// above already spent its own budget waiting for that. At 500 ms a single lost
+// callback held the only TX worker for up to 750 ms (250 + 500) before this
+// pass; now the worst case per lost callback is 160 ms (60 + 100).
+constexpr std::uint32_t kLateCallbackGraceMs = 100U;
 
 // Standard 802.11 MAC header: frame control at offset 0-1, then three 6-byte
 // address fields for a management frame at offsets 4, 10, 16. Address2 (10)
