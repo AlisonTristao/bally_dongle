@@ -249,7 +249,7 @@ std::size_t writeManifestData(const btp::Header& requestHeader, std::uint8_t sta
     header.status = status;
     header.flags = flags;
     header.error_code = errorCode;
-    header.manifest_format_version = kManifestFormatVersion;  // this dongle always serves format 2
+    header.manifest_format_version = kManifestFormatVersion;
     header.config_revision = configRevision;
     if (uuid != nullptr) std::memcpy(header.source_uuid, uuid, 16U);
     header.described_source_id = describedSourceId;

@@ -162,7 +162,7 @@ void test_ingest_then_serve_round_trips() {
     const size_t n = serve(kRobotSrc, out, sizeof(out));
     TEST_ASSERT_GREATER_THAN(60U, n);
     TEST_ASSERT_EQUAL_UINT8(0x00U, out[12]);            // status SUCCESS
-    TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + 16));    // this dongle always serves format 2
+    TEST_ASSERT_EQUAL_UINT16(3U, get_u16(out + 16));    // cached format-3 field records stay parseable
     TEST_ASSERT_EQUAL_HEX32(kRobotSrc, get_u32(out + 40));
     TEST_ASSERT_EQUAL_HEX32(kRobotBootA, get_u32(out + 44));
 
@@ -370,7 +370,7 @@ void test_source_info_block_round_trips_ingest_and_serve() {
     uint8_t out[512] = {0};
     const size_t n = serve(kRobotSrc, out, sizeof(out));
     TEST_ASSERT_GREATER_THAN(60U, n);
-    TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + 16));
+    TEST_ASSERT_EQUAL_UINT16(3U, get_u16(out + 16));
 
     size_t p = 60U + get_u16(out + 58);          // past the fixed prefix + source_name
     TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + p));  // info_count

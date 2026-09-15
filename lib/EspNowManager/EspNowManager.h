@@ -59,7 +59,12 @@ public:
 
     /**
      * @brief Initializes Wi-Fi station mode and ESP-NOW callbacks.
-     * @param channel ESP-NOW channel used for peer registration.
+     * @param channel ESP-NOW channel. 0 leaves the radio wherever WiFi.mode()
+     *   defaults it (historically channel 1) and only feeds peerInfo.channel
+     *   as "current channel"; a non-zero value is applied to the radio itself
+     *   via esp_wifi_set_channel() before any peer is registered -- must match
+     *   whatever channel the robot's own RobotSettings "ota,espnow_channel"
+     *   is set to, or the two sides simply never hear each other.
      * @param encrypt Enables encrypted peer registration when true.
      * @return true when initialization succeeds.
      */

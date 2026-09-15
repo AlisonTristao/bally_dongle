@@ -57,6 +57,14 @@ constexpr uint32_t kPeerOnlineWindowMs = 1500U;
 // map that epoch to Bally's local wall clock.
 constexpr char kDongleTimezone[] = "BRT3";
 
+// Must match every robot's RobotSettings "ota,espnow_channel" exactly, or
+// this dongle and that robot simply never hear each other -- see
+// EspNowManager::begin()'s own comment. Moved off channel 1 (both sides'
+// old default) to see whether some of the packet loss observed near a
+// robot's motors is ambient Wi-Fi congestion on that channel rather than
+// motor driver RF noise, which a channel change cannot fix either way.
+constexpr uint8_t kEspNowChannel = 11U;
+
 // This dongle's own MANIFEST_DATA source_info block (BTP/docs/commands.md
 // 3.12), serialized once at boot and handed to ManifestCache::configure().
 // Static so its bytes outlive begin(); ManifestCache only borrows the
@@ -775,7 +783,7 @@ void AppRuntime::begin() {
 
     logFreeHeap("after_asyncrx_queue");
 
-    if (!espNowManager_.begin(0, false)) {
+    if (!espNowManager_.begin(kEspNowChannel, false)) {
         ShellOutput::printTagged(Serial, "espnow", "init failed");
         return;
     }

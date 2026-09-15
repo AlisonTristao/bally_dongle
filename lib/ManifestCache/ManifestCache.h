@@ -39,11 +39,12 @@ namespace ManifestCache {
 
 constexpr std::uint16_t kManifestRequestObjectId = 0x0003U;
 constexpr std::uint16_t kManifestDataObjectId = 0x0004U;
-// Format 2 (BTP/docs/commands.md section 3.12) adds the source_info block
-// after source_name. This dongle emits format 2 for every source it serves
-// -- its own self-description and every cached robot -- and ingests format 1
-// or 2 from a robot (format 1 is treated as an empty source_info block).
-constexpr std::uint16_t kManifestFormatVersion = 2U;
+// Format 3 keeps format 2's source_info block and adds optional per-field
+// ranges. Cached topic/action records are stored verbatim, so the served
+// header must be at least as new as a cached robot manifest; otherwise a
+// format-3 field record with HAS_RANGE would be parsed using the format-2
+// layout and the catalog would be rejected by the desktop.
+constexpr std::uint16_t kManifestFormatVersion = 3U;
 
 constexpr std::uint8_t kSourceRoleRobot = 0x01U;
 constexpr std::uint8_t kSourceRoleDongle = 0x02U;
