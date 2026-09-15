@@ -362,10 +362,35 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
+    // Default modem sleep lets the radio doze between beacons, adding
+    // latency to both TX and RX -- same reasoning and same fix as
+    // bally_OS's own esp_wifi_set_ps(WIFI_PS_NONE) (BallyRobot.cpp,
+    // configureCommunication()). This side of the link never had it applied
+    // at all until now.
+    WiFi.setSleep(false);
+
+    // peerInfo.channel below (0 = "current channel") only WORKS if the radio
+    // is actually already on the channel a peer expects -- esp_now_add_peer()
+    // rejects a non-zero peerInfo.channel that disagrees with this, so a
+    // requested channel has to be applied here, before any peer exists.
+    if (channel != 0) {
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    }
+
     if (esp_now_init() != ESP_OK) {
         initialized_ = false;
         return false;
     }
+
+    // A fixed, explicit rate instead of the driver's default (legacy
+    // 802.11b, ~1 Mbps): shrinks per-frame airtime on every peer this
+    // interface talks to. Interface-wide (unlike bally_OS's per-peer
+    // esp_now_set_peer_rate_config -- this core's ESP-NOW predates that
+    // API), so one call here covers every current and future peer, no
+    // per-peer follow-up needed. MCS5_SGI matches the rate configured on
+    // the robot side (BallyRobot.cpp, configureCommunication()); walk both
+    // up together if bench margin allows it.
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS5_SGI);
 
     initialized_ = true;
     activeInstance_ = this;
