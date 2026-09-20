@@ -82,15 +82,19 @@ const std::uint8_t* keyL() noexcept;
 void clearKeyL() noexcept;
 
 /** Test-only: identical to clearKeyL(), named for symmetry with the other
- * *_registry/*_publisher resetForTests() helpers so env:native cases can
+ * *_registry / *_publisher resetForTests() helpers so env:native cases can
  * isolate each other. Production code never calls it. */
 void resetForTests() noexcept;
 
-#if defined(ARDUINO)
+#if defined(ARDUINO) || defined(ESP_PLATFORM)
 /**
- * @brief Persists the current key to NVS (Preferences, namespace
- * "ballykey") so it survives a reboot without the operator retyping the
- * password every time (topico 29 passo 3: "grava a chave em NVS").
+ * @brief Persists the current key to NVS (namespace "ballykey") so it
+ * survives a reboot without the operator retyping the password every time
+ * (topico 29 passo 3: "grava a chave em NVS"). Backed by Arduino's
+ * Preferences under `framework = arduino`, by raw nvs_* (ESP-IDF migration,
+ * PLANO_ESPIDF_DONGLE.md phase 4) under `framework = espidf` -- same
+ * namespace/key name either way, so a card provisioned under one framework
+ * still reads back under the other.
  *
  * False, and NVS left untouched, when hasKeyL() is false -- there is
  * nothing to persist.

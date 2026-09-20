@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Arduino.h>
+#include "compat.h"
+
 #include <SerialSession.h>
 #include <ShellLineEditor.h>
 #include <btp/codec.hpp>
@@ -82,7 +83,7 @@ using RelayToRadioFn = bool (*)(const std::uint8_t mac[6], const std::uint8_t* f
 // see SerialSession::Session's class comment for why the serial session's
 // Node has to be the one Endpoint every send on EITHER transport reserves
 // its sequence from.
-void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
+void begin(ByteIO& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
           const char* terminalPrompt, std::uint32_t sourceId, std::uint32_t bootId,
           RelayToRadioFn relayToRadio = nullptr) noexcept;
 

@@ -1,0 +1,8 @@
+## ESP-IDF Component Manager Manifest File
+dependencies:
+  # phase 6 (PLANO_ESPIDF_DONGLE.md secao 7). Same version constraint
+  # bally_OS/src/idf_component.yml pins, for the same reason: this is the
+  # esp_tinyusb version the project has actually been built and validated
+  # against on this target.
+  espressif/esp_tinyusb:
+    version: "^2.0.1~1"

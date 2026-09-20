@@ -16,6 +16,7 @@
 #include <freertos/queue.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -109,7 +110,7 @@ constexpr std::size_t classQueueItemSize(std::size_t classIdx) noexcept {
     return offsetof(QueuedFrame, bytes) + kClassFrameCap[classIdx];
 }
 
-Stream* g_io = nullptr;
+ByteIO* g_io = nullptr;
 RunShellLineFn g_runShellLine = nullptr;
 RelayToRadioFn g_relayToRadio = nullptr;
 
@@ -150,26 +151,35 @@ PendingWireFrame g_pendingWire;
 std::uint32_t g_lastStatusMs = 0U;
 
 // STATUS counters (BTP/docs/commands.md section 5).
-volatile std::uint64_t g_framesRx = 0U;
-volatile std::uint64_t g_framesTx = 0U;
-volatile std::uint64_t g_crcErrors = 0U;
-volatile std::uint64_t g_decodeErrors = 0U;
-volatile std::uint64_t g_reassemblyRejected = 0U; // fragmented frames received (unsupported, see SerialSession.h)
-volatile std::uint64_t g_telemetryDropped = 0U;
+//
+// std::atomic, not `volatile` (ESP-IDF migration, PLANO_ESPIDF_DONGLE.md):
+// GCC 15's `-Werror=volatile` rejects `++` on a volatile-qualified variable
+// (deprecated in C++20). atomic is the correct replacement, not a
+// warning-silencer -- volatile never made cross-task increments atomic, it
+// only stopped the compiler from caching the value in a register; these
+// counters are written from wherever pumpRx()/drainTx() run and read from
+// peekTxCounters() on (today) the same main-loop task, but the type should
+// not depend on that staying true.
+std::atomic<std::uint64_t> g_framesRx{0U};
+std::atomic<std::uint64_t> g_framesTx{0U};
+std::atomic<std::uint64_t> g_crcErrors{0U};
+std::atomic<std::uint64_t> g_decodeErrors{0U};
+std::atomic<std::uint64_t> g_reassemblyRejected{0U}; // fragmented frames received (unsupported, see SerialSession.h)
+std::atomic<std::uint64_t> g_telemetryDropped{0U};
 // Frames whose bytes could not all be pushed to the port -- a USB-CDC that
 // reports "not connected" (the host is not asserting DTR) makes every
 // write() return 0, so this counts, from the dongle's own console, exactly
 // the "cable is up but the desktop is deaf" failure. Diagnostic only, not
 // part of the STATUS wire schema.
-volatile std::uint64_t g_framesTxStalled = 0U;
-volatile std::uint64_t g_droppedByClass[kPriorityClassCount] = {0U, 0U, 0U, 0U};
+std::atomic<std::uint64_t> g_framesTxStalled{0U};
+std::atomic<std::uint64_t> g_droppedByClass[kPriorityClassCount] = {};
 // Downstream relay outcomes by reason -- see SerialMux.h's TxCounters for why
 // these are five counters and not one.
-volatile std::uint64_t g_relayDownOk = 0U;
-volatile std::uint64_t g_relayDownUnbound = 0U;
-volatile std::uint64_t g_relayDownNoPeer = 0U;
-volatile std::uint64_t g_relayDownOversized = 0U;
-volatile std::uint64_t g_relayDownSendFailed = 0U;
+std::atomic<std::uint64_t> g_relayDownOk{0U};
+std::atomic<std::uint64_t> g_relayDownUnbound{0U};
+std::atomic<std::uint64_t> g_relayDownNoPeer{0U};
+std::atomic<std::uint64_t> g_relayDownOversized{0U};
+std::atomic<std::uint64_t> g_relayDownSendFailed{0U};
 
 std::size_t classIndex(SerialSession::PriorityClass cls) noexcept {
     return static_cast<std::size_t>(cls);
@@ -1131,7 +1141,7 @@ void drainTx() noexcept {
 
 } // namespace
 
-void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
+void begin(ByteIO& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
           const char* terminalPrompt, std::uint32_t sourceId, std::uint32_t bootId,
           RelayToRadioFn relayToRadio) noexcept {
     g_io = &io;

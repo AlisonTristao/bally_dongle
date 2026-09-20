@@ -5,18 +5,24 @@
  * v1.1.0 "usb_hid" transport profile,
  * BTP/docs/fragmentation-and-transports.md section 3.3).
  *
- * This validates the composite CDC+HID device on the ESP32-S3 native USB OTG
- * peripheral (ARDUINO_USB_MODE=0) before any BTP framing is wired in:
- * begin()/tick() only echo whatever bytes the host writes to the HID vendor
- * report back out. That is enough to confirm on real hardware that:
+ * ESP-IDF migration, phase 6 (PLANO_ESPIDF_DONGLE.md secao 7): ported from
+ * arduino-esp32's USBHIDVendor to raw TinyUSB (tud_hid_* weak callbacks,
+ * implemented in UsbHidMux.cpp) against the HID interface
+ * UsbComposite::install() wires into the composite descriptor. Same
+ * echo-only behaviour as before this port -- begin()/tick() only bounce
+ * whatever bytes the host writes back out, no BTP framing wired in yet --
+ * validating on real hardware that:
  *
- * - Windows enumerates both the CDC port and the HID vendor interface
- *   simultaneously;
- * - the existing Serial/BTP-COBS console flow (SerialMux, StartupConfig's
- *   port-open wait, reset-to-bootloader via DTR) survives the
- *   ARDUINO_USB_MODE=1 -> 0 switch unregressed;
- * - sustained simultaneous CDC+HID traffic does not trip the known
- *   arduino-esp32 core 2.x stall bugs (issues #9582/#10307/#11600).
+ * - the host still enumerates both the CDC port and the HID vendor
+ *   interface simultaneously under the hand-built descriptor
+ *   (UsbComposite.cpp), now that neither comes from arduino-esp32's
+ *   ARDUINO_USB_MODE=0 nor from esp_tinyusb's own Kconfig-driven descriptor
+ *   generator (which does not wire up HID at all -- see UsbComposite.cpp's
+ *   header comment);
+ * - the shell/BTP console (SerialMux, now over ConsoleCdc/tinyusb_cdcacm)
+ *   survives alongside sustained HID traffic;
+ * - the HID class driver TinyUSB itself provides needs no more than the
+ *   handful of tud_hid_* callbacks this file implements.
  *
  * Once validated, this module grows into the real transport: BTP session
  * wiring (reusing or trimming SerialSession, see its own header), a new
@@ -26,12 +32,17 @@
  */
 namespace UsbHidMux {
 
-/** Starts the HID vendor interface. Call once from AppRuntime::begin(),
- * alongside SerialMux::begin() -- both USB interfaces stay active together. */
+/** Marks the HID vendor interface ready to echo. Call once from
+ * app_main()/AppRuntime::begin(), after UsbComposite::install() has already
+ * wired the HID interface into the TinyUSB stack -- unlike the old
+ * USBHIDVendor, there is no separate begin() on the TinyUSB side to call
+ * here, tud_hid_* callbacks are live as soon as the composite device is
+ * installed. */
 void begin();
 
-/** Echoes any bytes received on the HID vendor report back out. Call once
- * per AppRuntime::tick(); a fast no-op when nothing was received. */
+/** Sends back whatever the most recent tud_hid_set_report_cb received, once
+ * the IN endpoint is free. Call once per AppRuntime::tick(); a fast no-op
+ * when nothing is pending. */
 void tick();
 
 } // namespace UsbHidMux

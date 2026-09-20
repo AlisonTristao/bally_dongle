@@ -1,18 +1,38 @@
 #pragma once
 
-#include <Arduino.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
+#include <cstdint>
+#include <string>
 
-class DongleSt7735 final : public Adafruit_ST7735 {
+#include <LovyanGFX.hpp>
+
+// ESP-IDF migration, phase 7 (PLANO_ESPIDF_DONGLE.md secao 6, D1): the LCD
+// stack is rewritten against LovyanGFX (its esp32/Bus_SPI backend talks to
+// the IDF SPI driver directly -- no Arduino dependency, auto-selected by
+// LovyanGFX.hpp itself off ESP_PLATFORM/CONFIG_IDF_TARGET_ESP32S3) instead
+// of Adafruit_GFX/Adafruit_ST7735. Every method below keeps its pre-
+// migration name and behaviour; only the panel driver underneath changed.
+//
+// SD-card methods that used to live on DonglePeripherals (beginSd,
+// isSdReady, sdCardTypeName, wipeSdContents, ...) are NOT ported here --
+// phase 5 already carved that out into DongleSdCard
+// (esp_vfs_fat_sdmmc_mount), so the old SD_MMC-based code this class used
+// to carry was dead weight even before this port. Use DongleSdCard instead.
+
+/**
+ * @brief Custom LGFX_Device for the LILYGO T-Dongle-S3's onboard 0.96" ST7735
+ * (160x80, "R"-variant init sequence -- same chip family the old
+ * Adafruit_ST7735::initR() call targeted, see Panel_ST7735S vs. the
+ * B-variant Panel_ST7735). No MISO wiring on this board (write-only bus,
+ * same as the old software-SPI 4-wire Adafruit constructor), so `readable`
+ * stays false.
+ */
+class DongleLcd final : public lgfx::LGFX_Device {
 public:
-    DongleSt7735(int8_t cs, int8_t dc, int8_t mosi, int8_t sclk, int8_t rst = -1)
-        : Adafruit_ST7735(cs, dc, mosi, sclk, rst) {
-    }
+    DongleLcd();
 
-    void setPanelOffset(int8_t colStart, int8_t rowStart) {
-        setColRowStart(colStart, rowStart);
-    }
+private:
+    lgfx::Panel_ST7735S panel_;
+    lgfx::Bus_SPI bus_;
 };
 
 /**
@@ -21,7 +41,6 @@ public:
  * Covered peripherals:
  * - onboard RGB LED driver (DI/CI)
  * - ST7735 LCD display
- * - TF card through SD_MMC
  */
 class DonglePeripherals final {
 public:
@@ -81,7 +100,7 @@ public:
     /**
      * @brief Returns LCD object pointer, ensuring init when possible.
      */
-    Adafruit_ST7735* lcd();
+    DongleLcd* lcd();
 
     /**
      * @brief Controls LCD backlight pin.
@@ -108,75 +127,19 @@ public:
      * @brief Clears screen and writes text at top-left.
      * @param text Text to print.
      * @param clearFirst Clear screen before print.
-     * @param color ST77XX text color.
+     * @param color RGB565 text color (0xFFFF = white).
      */
-    bool writeLcd(const String& text, bool clearFirst = true, uint16_t color = ST77XX_WHITE);
+    bool writeLcd(const std::string& text, bool clearFirst = true, uint16_t color = 0xFFFF);
 
     /**
      * @brief Fills LCD screen with one color.
      */
-    bool clearLcd(uint16_t color = ST77XX_BLACK);
-
-    /**
-     * @brief Initializes SD card over SD_MMC pins.
-     * @param oneBitMode true for 1-bit mode, false for 4-bit mode.
-     */
-    bool beginSd(bool oneBitMode = false);
-
-    /**
-     * @brief Returns true when SD card is mounted and ready.
-     */
-    bool isSdReady() const;
-
-    /**
-     * @brief Returns active SD bus width mode.
-     * @return true when operating in 1-bit mode, false for 4-bit mode.
-     */
-    bool sdOneBitMode() const;
-
-    /**
-     * @brief Returns SD host clock frequency in kHz for the active mount.
-     */
-    uint32_t sdFrequencyKHz() const;
-
-    /**
-     * @brief Returns SD card type as text.
-     */
-    String sdCardTypeName() const;
-
-    /**
-     * @brief Total SD capacity in megabytes.
-     */
-    uint64_t sdTotalMB() const;
-
-    /**
-     * @brief Total SD capacity in bytes.
-     */
-    uint64_t sdTotalBytes() const;
-
-    /**
-     * @brief Used SD bytes in megabytes.
-     */
-    uint64_t sdUsedMB() const;
-
-    /**
-     * @brief Used SD capacity in bytes.
-     */
-    uint64_t sdUsedBytes() const;
-
-    /**
-     * @brief Removes all files/folders from SD root.
-     * @return true when cleanup succeeds.
-     */
-    bool wipeSdContents();
+    bool clearLcd(uint16_t color = 0x0000);
 
 private:
-    DongleSt7735 tft_;
+    DongleLcd tft_;
     bool ledReady_;
     bool lcdReady_;
-    bool sdReady_;
-    bool sdOneBitMode_;
-    uint32_t sdFrequencyKHz_;
     bool lcdBacklightOn_;
     bool lcdBacklightActiveHigh_;
     uint8_t lcdRotation_;

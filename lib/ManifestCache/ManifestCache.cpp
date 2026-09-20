@@ -4,6 +4,7 @@
 #include <DonglePublisher.h>
 #include <btp/messages.hpp>
 
+#include <atomic>
 #include <cstring>
 
 namespace ManifestCache {
@@ -83,15 +84,20 @@ std::size_t g_selfSourceInfoSize = 0U;
 // wherever a source has no info of its own.
 const std::uint8_t kEmptySourceInfo[2] = {0U, 0U};
 
-// Diagnostico (plano 36 fase 0a). volatile, mesmo estilo dos contadores de
-// EspNowConfig -- RX roda na task WiFi, o shell le na main.
-volatile std::uint32_t g_diagPrimeSent = 0U;
-volatile std::uint32_t g_diagIngestOk = 0U;
-volatile std::uint32_t g_diagIngestFail = 0U;
-volatile std::uint32_t g_diagConsumeRejected = 0U;
-volatile std::uint32_t g_diagTargetedRx = 0U;
-volatile std::uint32_t g_diagTargetedHit = 0U;
-volatile std::uint32_t g_diagTargetedMiss = 0U;
+// Diagnostico (plano 36 fase 0a). std::atomic (relaxed by ++'s default,
+// seq_cst), mesmo estilo dos contadores de EspNowConfig -- RX roda na task
+// WiFi, o shell le na main. Era `volatile`; GCC 15 (ESP-IDF 6.x toolchain,
+// migracao PLANO_ESPIDF_DONGLE.md) trata `++` em volatile como erro
+// (-Werror=volatile, deprecated em C++20) -- atomic e o substituto correto,
+// nao so um jeito de calar o warning: volatile nunca garantiu atomicidade
+// entre tasks, so impedia o compilador de otimizar a leitura/escrita fora.
+std::atomic<std::uint32_t> g_diagPrimeSent{0U};
+std::atomic<std::uint32_t> g_diagIngestOk{0U};
+std::atomic<std::uint32_t> g_diagIngestFail{0U};
+std::atomic<std::uint32_t> g_diagConsumeRejected{0U};
+std::atomic<std::uint32_t> g_diagTargetedRx{0U};
+std::atomic<std::uint32_t> g_diagTargetedHit{0U};
+std::atomic<std::uint32_t> g_diagTargetedMiss{0U};
 
 std::uint16_t read_u16_le(const std::uint8_t* data) noexcept {
     return static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8U);

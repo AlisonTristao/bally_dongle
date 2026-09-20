@@ -2,13 +2,23 @@
 
 #include <cstdio>
 #include <cstring>
+#include <driver/gpio.h>
 
-#include "../../include/config.h"
+#include "compat.h"
+#include "config.h"
+#include "string_compat.h"
 
 namespace {
 
-constexpr uint16_t kRawWhite = ST77XX_WHITE;
-constexpr uint16_t kRawBlack = ST77XX_BLACK;
+// Raw RGB565 constants -- replace the old Adafruit_ST7735.h ST77XX_* macros
+// (same values, this file never depended on the Adafruit driver for
+// anything but these names).
+constexpr uint16_t kRawWhite = 0xFFFF;
+constexpr uint16_t kRawBlack = 0x0000;
+constexpr uint16_t kRawRed = 0xF800;
+constexpr uint16_t kRawYellow = 0xFFE0;
+constexpr uint16_t kRawGreen = 0x07E0;
+constexpr uint16_t kRawCyan = 0x07FF;
 constexpr uint16_t kRawGridLine = 0xC618; // light gray, structural chrome (not panel-corrected)
 constexpr uint16_t kNeutralGray565 = 0x8410;
 constexpr int16_t kBarHeight = 16;
@@ -78,7 +88,7 @@ bool LcdDashboard::begin(DonglePeripherals& peripherals) {
     // A flash cycle holds BOOT down to enter the bootloader; sample the real
     // level here instead of assuming "released", so that release doesn't
     // read as a spurious first press once the app starts polling.
-    buttonPressedLast_ = (digitalRead(BoardConfig::PIN_BOOT_BUTTON) == LOW);
+    buttonPressedLast_ = (gpio_get_level(BoardConfig::PIN_BOOT_BUTTON) == 0);
     resetCaches();
 
     tft_->fillScreen(kRawWhite);
@@ -116,8 +126,8 @@ bool LcdDashboard::isReady() const {
 }
 
 void LcdDashboard::layoutChrome() {
-    screenW_ = tft_->width();
-    screenH_ = tft_->height();
+    screenW_ = static_cast<int16_t>(tft_->width());
+    screenH_ = static_cast<int16_t>(tft_->height());
 
     pageIndicatorRect_ = {static_cast<int16_t>(screenW_ - kPageIndicatorWidth), 0, kPageIndicatorWidth, kBarHeight};
     messageRect_ = {0, 0, static_cast<int16_t>(screenW_ - kPageIndicatorWidth), kBarHeight};
@@ -176,7 +186,7 @@ void LcdDashboard::drawLabel(const Rect& tile, const char* label) {
     tft_->print(label);
 }
 
-void LcdDashboard::drawCenteredValue(const Rect& tile, const String& text, uint16_t color, uint8_t textSize) {
+void LcdDashboard::drawCenteredValue(const Rect& tile, const std::string& text, uint16_t color, uint8_t textSize) {
     const Rect area = valueArea(tile);
     tft_->fillRect(area.x, area.y, area.w, area.h, kRawWhite);
     if (text.length() == 0) {
@@ -184,18 +194,18 @@ void LcdDashboard::drawCenteredValue(const Rect& tile, const String& text, uint1
     }
 
     tft_->setTextSize(textSize);
-    int16_t x1 = 0;
-    int16_t y1 = 0;
-    uint16_t tw = 0;
-    uint16_t th = 0;
-    tft_->getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+    // LovyanGFX's built-in font draws from an exact top-left origin (no
+    // Adafruit-GFX-style x1/y1 glyph-origin correction needed) -- textWidth/
+    // fontHeight already account for the size just set above.
+    const int16_t tw = static_cast<int16_t>(tft_->textWidth(text.c_str()));
+    const int16_t th = static_cast<int16_t>(tft_->fontHeight());
 
-    const int16_t cx = static_cast<int16_t>(area.x + (area.w - static_cast<int16_t>(tw)) / 2 - x1);
-    const int16_t cy = static_cast<int16_t>(area.y + (area.h - static_cast<int16_t>(th)) / 2 - y1);
+    const int16_t cx = static_cast<int16_t>(area.x + (area.w - tw) / 2);
+    const int16_t cy = static_cast<int16_t>(area.y + (area.h - th) / 2);
 
     tft_->setCursor(cx, cy);
     tft_->setTextColor(color, kRawWhite);
-    tft_->print(text);
+    tft_->print(text.c_str());
 }
 
 void LcdDashboard::drawActivityDot(const Rect& tile, const char* label, uint16_t color) {
@@ -230,11 +240,11 @@ void LcdDashboard::drawActivityDot(const Rect& tile, const char* label, uint16_t
     tft_->fillCircle(cx, cy, radius, color);
 }
 
-void LcdDashboard::drawTextLine(int16_t x, int16_t y, const String& text, uint16_t color) {
+void LcdDashboard::drawTextLine(int16_t x, int16_t y, const std::string& text, uint16_t color) {
     tft_->setTextSize(1);
     tft_->setCursor(x, y);
     tft_->setTextColor(color, kRawWhite);
-    tft_->print(text);
+    tft_->print(text.c_str());
 }
 
 void LcdDashboard::drawPageIndicator() {
@@ -265,7 +275,7 @@ void LcdDashboard::drawActivityChrome() {
 }
 
 void LcdDashboard::pollButton() {
-    const bool pressed = (digitalRead(BoardConfig::PIN_BOOT_BUTTON) == LOW);
+    const bool pressed = (gpio_get_level(BoardConfig::PIN_BOOT_BUTTON) == 0);
     // tick() only samples this once per REFRESH_INTERVAL_MS (150ms), well
     // past any mechanical bounce, so a simple level compare across samples
     // is enough debounce -- no separate timer needed. Advances on the press
@@ -300,23 +310,23 @@ void LcdDashboard::switchToPage(Page page) {
     drawPageIndicator();
 }
 
-void LcdDashboard::showMessage(const String& text, uint16_t color) {
+void LcdDashboard::showMessage(const std::string& text, uint16_t color) {
     if (!ready_) {
         return;
     }
 
-    String oneLine = text;
-    oneLine.replace('\r', ' ');
-    oneLine.replace('\n', ' ');
-    oneLine.trim();
+    std::string oneLine = text;
+    strcompat::replaceAll(oneLine, "\r", " ");
+    strcompat::replaceAll(oneLine, "\n", " ");
+    strcompat::trim(oneLine);
 
     const int16_t charWidth = 6;
     const int16_t maxChars = (messageRect_.w > 4) ? static_cast<int16_t>((messageRect_.w - 4) / charWidth) : 0;
     if (maxChars > 0 && oneLine.length() > static_cast<unsigned>(maxChars)) {
         if (maxChars > 3) {
-            oneLine = oneLine.substring(0, maxChars - 3) + "...";
+            oneLine = strcompat::substring(oneLine, 0, static_cast<size_t>(maxChars - 3)) + "...";
         } else {
-            oneLine = oneLine.substring(0, maxChars);
+            oneLine = strcompat::substring(oneLine, 0, static_cast<size_t>(maxChars));
         }
     }
 
@@ -324,7 +334,7 @@ void LcdDashboard::showMessage(const String& text, uint16_t color) {
     tft_->setTextSize(1);
     tft_->setCursor(static_cast<int16_t>(messageRect_.x + 2), static_cast<int16_t>(messageRect_.y + (messageRect_.h - 8) / 2));
     tft_->setTextColor(color, kRawWhite);
-    tft_->print(oneLine);
+    tft_->print(oneLine.c_str());
 
     messageExpireMs_ = millis() + MESSAGE_HOLD_MS;
     messageActive_ = true;
@@ -340,27 +350,29 @@ void LcdDashboard::notifyTx(bool delivered) {
     txHasResult_ = true;
 }
 
-void LcdDashboard::notifyRobotState(const String& state) {
+void LcdDashboard::notifyRobotState(const std::string& state) {
     if (!ready_) {
         return;
     }
 
-    String text = state;
-    text.trim();
+    std::string text = state;
+    strcompat::trim(text);
     if (text.length() == 0) {
         text = "?";
     }
 
-    String lower = text;
-    lower.toLowerCase();
+    std::string lower = text;
+    strcompat::toLowerCase(lower);
     uint16_t logicalColor = kNeutralGray565;
-    if (lower.indexOf("erro") >= 0 || lower.indexOf("error") >= 0 || lower.indexOf("fault") >= 0) {
-        logicalColor = ST77XX_RED;
-    } else if (lower.indexOf("warn") >= 0 || lower.indexOf("aviso") >= 0) {
-        logicalColor = ST77XX_YELLOW;
-    } else if (lower.indexOf("ok") >= 0 || lower.indexOf("pronto") >= 0 || lower.indexOf("ready") >= 0 ||
-               lower.indexOf("idle") >= 0 || lower.indexOf("run") >= 0) {
-        logicalColor = ST77XX_GREEN;
+    if (strcompat::indexOf(lower, "erro") >= 0 || strcompat::indexOf(lower, "error") >= 0 ||
+        strcompat::indexOf(lower, "fault") >= 0) {
+        logicalColor = kRawRed;
+    } else if (strcompat::indexOf(lower, "warn") >= 0 || strcompat::indexOf(lower, "aviso") >= 0) {
+        logicalColor = kRawYellow;
+    } else if (strcompat::indexOf(lower, "ok") >= 0 || strcompat::indexOf(lower, "pronto") >= 0 ||
+               strcompat::indexOf(lower, "ready") >= 0 || strcompat::indexOf(lower, "idle") >= 0 ||
+               strcompat::indexOf(lower, "run") >= 0) {
+        logicalColor = kRawGreen;
     }
     const uint16_t color = toPanelColor(logicalColor);
 
@@ -372,9 +384,9 @@ void LcdDashboard::notifyRobotState(const String& state) {
     const int16_t charWidth = 6;
     const int16_t maxChars = (stateRect_.w > 4) ? static_cast<int16_t>((stateRect_.w - 4) / charWidth) : 0;
     if (maxChars > 3 && text.length() > static_cast<unsigned>(maxChars)) {
-        text = text.substring(0, maxChars - 3) + "...";
+        text = strcompat::substring(text, 0, static_cast<size_t>(maxChars - 3)) + "...";
     } else if (maxChars > 0 && text.length() > static_cast<unsigned>(maxChars)) {
-        text = text.substring(0, maxChars);
+        text = strcompat::substring(text, 0, static_cast<size_t>(maxChars));
     }
 
     drawTextLine(static_cast<int16_t>(stateRect_.x + 2),
@@ -475,7 +487,7 @@ void LcdDashboard::refreshRxTile(uint32_t now) {
     rxCacheValid_ = true;
     rxHotDrawn_ = hot;
 
-    const uint16_t color = toPanelColor(hot ? ST77XX_CYAN : kNeutralGray565);
+    const uint16_t color = toPanelColor(hot ? kRawCyan : kNeutralGray565);
     drawActivityDot(rxTile_, "RX", color);
 }
 
@@ -494,9 +506,9 @@ void LcdDashboard::refreshTxTile(uint32_t now) {
 
     uint16_t logicalColor = kNeutralGray565;
     if (hot) {
-        logicalColor = ST77XX_CYAN;
+        logicalColor = kRawCyan;
     } else if (hasResult) {
-        logicalColor = ok ? ST77XX_GREEN : ST77XX_RED;
+        logicalColor = ok ? kRawGreen : kRawRed;
     }
 
     drawActivityDot(txTile_, "TX", toPanelColor(logicalColor));
@@ -517,7 +529,7 @@ void LcdDashboard::refreshPeersTile() {
 
     uint16_t logicalColor = kNeutralGray565;
     if (total > 0) {
-        logicalColor = (online == 0) ? ST77XX_RED : ((online < total) ? ST77XX_YELLOW : ST77XX_GREEN);
+        logicalColor = (online == 0) ? kRawRed : ((online < total) ? kRawYellow : kRawGreen);
     }
 
     drawCenteredValue(peersTile_, buf, toPanelColor(logicalColor), 2);
@@ -535,7 +547,7 @@ void LcdDashboard::refreshErrorsPage() {
 
     const uint32_t total = live.droppedRx + live.droppedDecode + live.droppedCrc + live.droppedReassembly +
                             live.droppedQueueFull + live.droppedAuth;
-    const uint16_t color = toPanelColor((total > 0) ? ST77XX_RED : kNeutralGray565);
+    const uint16_t color = toPanelColor((total > 0) ? kRawRed : kNeutralGray565);
 
     char line1[24] = {0};
     char line2[24] = {0};
@@ -578,7 +590,7 @@ void LcdDashboard::refreshSessionPage() {
     int16_t y = static_cast<int16_t>(contentRect_.y + 2);
 
     const char* btpLabel = live.consoleOwned ? "Console" : (live.protocolled ? "Protocolado" : "Aguardando");
-    const uint16_t btpColor = live.consoleOwned ? kNeutralGray565 : (live.protocolled ? ST77XX_GREEN : ST77XX_YELLOW);
+    const uint16_t btpColor = live.consoleOwned ? kNeutralGray565 : (live.protocolled ? kRawGreen : kRawYellow);
     char line1[24] = {0};
     std::snprintf(line1, sizeof(line1), "BTP: %s", btpLabel);
     drawTextLine(x, y, line1, toPanelColor(btpColor));
@@ -591,11 +603,11 @@ void LcdDashboard::refreshSessionPage() {
     } else {
         std::snprintf(line2, sizeof(line2), "SD ausente");
     }
-    drawTextLine(x, y, line2, toPanelColor(live.sdReady ? ST77XX_GREEN : kNeutralGray565));
+    drawTextLine(x, y, line2, toPanelColor(live.sdReady ? kRawGreen : kNeutralGray565));
     y = static_cast<int16_t>(y + kTextLineHeight);
 
     const char* dbLabel = live.dbReady ? "DB pronto" : "DB indisponivel";
-    drawTextLine(x, y, dbLabel, toPanelColor(live.dbReady ? ST77XX_GREEN : kNeutralGray565));
+    drawTextLine(x, y, dbLabel, toPanelColor(live.dbReady ? kRawGreen : kNeutralGray565));
 }
 
 void LcdDashboard::refreshPeersPage() {
@@ -642,7 +654,7 @@ void LcdDashboard::refreshPeersPage() {
         std::snprintf(line, sizeof(line), "%04lX  %lus",
                       static_cast<unsigned long>(peerRows_[i].sourceId & 0xFFFFUL),
                       static_cast<unsigned long>(peerRows_[i].lastSeenAgeMs / 1000U));
-        const uint16_t color = toPanelColor(peerRows_[i].online ? ST77XX_GREEN : kNeutralGray565);
+        const uint16_t color = toPanelColor(peerRows_[i].online ? kRawGreen : kNeutralGray565);
         drawTextLine(x, y, line, color);
         y = static_cast<int16_t>(y + kTextLineHeight);
     }

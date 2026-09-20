@@ -1,6 +1,8 @@
 #pragma once
 
-#include <Arduino.h>
+#include <cstddef>
+#include <cstdint>
+
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <RadioTxScheduler.h>
@@ -232,24 +234,15 @@ private:
     ReceiveCallback receiveCallback_;
     SendCallback sendCallback_;
 
-    /** Static adapter for ESP-NOW receive callback. */
-    static void handleReceiveStatic(const uint8_t* mac, const uint8_t* incomingData, int len);
+    /** Static adapter for ESP-NOW receive callback. Real ESP-IDF's
+     * esp_now_recv_info_t (unlike arduino-esp32's bare `const uint8_t* mac`)
+     * already carries the source MAC and rx_ctrl.rssi directly -- see the
+     * .cpp's handleReceiveStatic comment for why that retired the promiscuous
+     * RSSI sniffer this class used to also run. */
+    static void handleReceiveStatic(const esp_now_recv_info_t* info, const uint8_t* incomingData, int len);
 
     /** Static adapter for ESP-NOW send callback. */
-    static void handleSendStatic(const uint8_t* mac, esp_now_send_status_t status);
-
-    /**
-     * @brief Wi-Fi promiscuous-mode RX sniffer, running alongside ESP-NOW.
-     *
-     * This Arduino-ESP32 core's esp_now_recv_cb_t predates
-     * esp_now_recv_info_t, so ESP-NOW's own receive callback carries no
-     * RSSI. ESP-NOW rides on ordinary 802.11 Action frames though, so a
-     * promiscuous sniffer on the same fixed channel sees the identical
-     * over-the-air frame and does get rx_ctrl.rssi. This just records the
-     * RSSI against the sending peer's MAC (deviceInfo::lastRssi);
-     * handleReceiveStatic reads it back for that same frame.
-     */
-    static void handlePromiscuousRxStatic(void* buf, wifi_promiscuous_pkt_type_t type);
+    static void handleSendStatic(const esp_now_send_info_t* txInfo, esp_now_send_status_t status);
 
     /** Adds one peer to ESP-NOW runtime table. */
     bool addPeerToEspNow(const uint8_t mac[6]) const;

@@ -1,99 +1,66 @@
 #include "DonglePeripherals.h"
-#include "ShellOutput.h"
 
-#include <SD_MMC.h>
-#include <FS.h>
 #include <driver/gpio.h>
 
-#include "../../include/config.h"
+#include "compat.h"
+#include "config.h"
 
-namespace {
-
-String normalizeFsPath(const String& path) {
-    if (path.isEmpty()) {
-        return "/";
+DongleLcd::DongleLcd() {
+    {
+        auto cfg = bus_.config();
+        cfg.spi_host = SPI2_HOST;
+        cfg.spi_mode = 0;
+        cfg.freq_write = 27000000;
+        cfg.freq_read = 14000000;
+        // Write-only bus (no MISO on this board, same as the old software-
+        // SPI 4-wire Adafruit constructor) -- spi_3wire is for half-duplex
+        // reads over MOSI, not needed when nothing ever reads back.
+        cfg.spi_3wire = false;
+        cfg.use_lock = true;
+        cfg.dma_channel = SPI_DMA_CH_AUTO;
+        cfg.pin_sclk = BoardConfig::PIN_TFT_SCL;
+        cfg.pin_mosi = BoardConfig::PIN_TFT_SDA;
+        cfg.pin_miso = -1;
+        cfg.pin_dc = BoardConfig::PIN_TFT_DC;
+        bus_.config(cfg);
+        panel_.setBus(&bus_);
     }
 
-    if (path.startsWith("/")) {
-        return path;
+    {
+        auto cfg = panel_.config();
+        cfg.pin_cs = BoardConfig::PIN_TFT_CS;
+        cfg.pin_rst = BoardConfig::PIN_TFT_RES;
+        cfg.pin_busy = -1;
+        // Native chip resolution before rotation (portrait) -- matches what
+        // Adafruit_ST7735::initR(INITR_MINI160x80) set internally
+        // (_width=80, _height=160). setRotation(1) at beginLcd() time is
+        // what turns this into the 160x80 landscape the board's glass
+        // actually shows.
+        cfg.panel_width = 80;
+        cfg.panel_height = 160;
+        cfg.memory_width = 80;
+        cfg.memory_height = 160;
+        // Same RAM col/row offsets as the old DongleSt7735::setPanelOffset()
+        // call (BoardConfig::TFT_COL_START/TFT_ROW_START) -- calibrated
+        // against this specific panel, not a LovyanGFX default.
+        cfg.offset_x = BoardConfig::TFT_COL_START;
+        cfg.offset_y = BoardConfig::TFT_ROW_START;
+        cfg.offset_rotation = 0;
+        cfg.readable = false;
+        cfg.invert = false;
+        cfg.rgb_order = false;
+        cfg.dlen_16bit = false;
+        cfg.bus_shared = false;
+        panel_.config(cfg);
     }
 
-    String normalized = "/";
-    normalized += path;
-    return normalized;
+    setPanel(&panel_);
 }
-
-bool removeTree(fs::FS& fs, const String& rawPath) {
-    const String path = normalizeFsPath(rawPath);
-    File node = fs.open(path);
-    if (!node) {
-        return false;
-    }
-
-    const bool isDirectory = node.isDirectory();
-    node.close();
-
-    if (!isDirectory) {
-        return fs.remove(path);
-    }
-
-    File directory = fs.open(path);
-    if (!directory || !directory.isDirectory()) {
-        return false;
-    }
-
-    File entry = directory.openNextFile();
-    while (entry) {
-        String entryName = String(entry.name());
-        String entryPath;
-
-        if (!entryName.isEmpty() && path != "/" && entryName.startsWith(path + "/")) {
-            // Already absolute path under current directory.
-            entryPath = entryName;
-        } else {
-            if (entryName.startsWith("/")) {
-                entryName.remove(0, 1);
-            }
-
-            if (path == "/") {
-                entryPath = "/" + entryName;
-            } else {
-                entryPath = path + "/" + entryName;
-            }
-        }
-
-        entryPath = normalizeFsPath(entryPath);
-        const bool entryIsDir = entry.isDirectory();
-        entry.close();
-
-        const bool ok = entryIsDir ? removeTree(fs, entryPath) : fs.remove(entryPath);
-        if (!ok) {
-            directory.close();
-            return false;
-        }
-
-        entry = directory.openNextFile();
-    }
-
-    directory.close();
-    return fs.rmdir(path);
-}
-
-} // namespace
 
 DonglePeripherals::DonglePeripherals()
-    : tft_(
-        BoardConfig::PIN_TFT_CS,
-        BoardConfig::PIN_TFT_DC,
-        BoardConfig::PIN_TFT_SDA,
-        BoardConfig::PIN_TFT_SCL,
-        BoardConfig::PIN_TFT_RES
-    ),
+    : tft_(),
       ledReady_(false),
       lcdReady_(false),
-      sdReady_(false),
-      sdOneBitMode_(false),
-      sdFrequencyKHz_(0),
       lcdBacklightOn_(false),
       lcdBacklightActiveHigh_(false),
       lcdRotation_(1) {
@@ -106,10 +73,10 @@ void DonglePeripherals::begin() {
 }
 
 bool DonglePeripherals::beginLed() {
-    pinMode(BoardConfig::PIN_LED_DI, OUTPUT);
-    pinMode(BoardConfig::PIN_LED_CI, OUTPUT);
-    digitalWrite(BoardConfig::PIN_LED_DI, LOW);
-    digitalWrite(BoardConfig::PIN_LED_CI, LOW);
+    gpio_set_direction(BoardConfig::PIN_LED_DI, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BoardConfig::PIN_LED_CI, GPIO_MODE_OUTPUT);
+    gpio_set_level(BoardConfig::PIN_LED_DI, 0);
+    gpio_set_level(BoardConfig::PIN_LED_CI, 0);
     ledReady_ = true;
     return true;
 }
@@ -133,31 +100,21 @@ void DonglePeripherals::ledOff() {
 bool DonglePeripherals::beginLcd(uint8_t rotation) {
     lcdRotation_ = static_cast<uint8_t>(rotation % 4);
 
-    // Hardware reset sequence increases reliability on cold boot.
-    pinMode(BoardConfig::PIN_TFT_RES, OUTPUT);
-    digitalWrite(BoardConfig::PIN_TFT_RES, HIGH);
-    delay(5);
-    digitalWrite(BoardConfig::PIN_TFT_RES, LOW);
-    delay(20);
-    digitalWrite(BoardConfig::PIN_TFT_RES, HIGH);
-    delay(120);
-
     // Keep backlight on while running init sequence.
     setLcdBacklight(true);
 
-#if defined(INITR_MINI160x80)
-    tft_.initR(INITR_MINI160x80);
-#else
-    tft_.initR(INITR_BLACKTAB);
-#endif
-    // Align panel RAM window to avoid shifted/garbled content.
-    tft_.setPanelOffset(
-        static_cast<int8_t>(BoardConfig::TFT_COL_START),
-        static_cast<int8_t>(BoardConfig::TFT_ROW_START)
-    );
+    // init()'s default init_impl(use_reset=true, ...) pulses pin_rst itself
+    // (config'd in DongleLcd's constructor) -- no separate manual reset
+    // sequence needed here, unlike the old Adafruit_ST7735 code this
+    // replaces.
+    if (!tft_.init()) {
+        lcdReady_ = false;
+        return false;
+    }
+
     tft_.setRotation(lcdRotation_);
-    tft_.fillScreen(ST77XX_WHITE);
-    tft_.setTextColor(ST77XX_BLACK);
+    tft_.fillScreen(0xFFFF);
+    tft_.setTextColor(0x0000);
     tft_.setTextSize(1);
     tft_.setTextWrap(true);
     tft_.setCursor(0, 0);
@@ -183,7 +140,7 @@ void DonglePeripherals::setLcdRotation(uint8_t rotation) {
     }
 
     tft_.setRotation(lcdRotation_);
-    tft_.fillScreen(ST77XX_BLACK);
+    tft_.fillScreen(0x0000);
     tft_.setCursor(0, 0);
 }
 
@@ -191,7 +148,7 @@ uint8_t DonglePeripherals::lcdRotation() const {
     return lcdRotation_;
 }
 
-Adafruit_ST7735* DonglePeripherals::lcd() {
+DongleLcd* DonglePeripherals::lcd() {
     if (!lcdReady_ && !beginLcd(lcdRotation_)) {
         return nullptr;
     }
@@ -200,10 +157,10 @@ Adafruit_ST7735* DonglePeripherals::lcd() {
 }
 
 void DonglePeripherals::setLcdBacklight(bool on) {
-    pinMode(BoardConfig::PIN_TFT_LED, OUTPUT);
+    gpio_set_direction(BoardConfig::PIN_TFT_LED, GPIO_MODE_OUTPUT);
     lcdBacklightOn_ = on;
     const bool pinLevel = lcdBacklightActiveHigh_ ? lcdBacklightOn_ : !lcdBacklightOn_;
-    digitalWrite(BoardConfig::PIN_TFT_LED, pinLevel ? HIGH : LOW);
+    gpio_set_level(BoardConfig::PIN_TFT_LED, pinLevel ? 1 : 0);
 }
 
 void DonglePeripherals::setLcdBacklightPolarity(bool activeHigh) {
@@ -219,7 +176,7 @@ bool DonglePeripherals::isLcdBacklightActiveHigh() const {
     return lcdBacklightActiveHigh_;
 }
 
-bool DonglePeripherals::writeLcd(const String& text, bool clearFirst, uint16_t color) {
+bool DonglePeripherals::writeLcd(const std::string& text, bool clearFirst, uint16_t color) {
     if (!lcdReady_ && !beginLcd(lcdRotation_)) {
         return false;
     }
@@ -227,12 +184,12 @@ bool DonglePeripherals::writeLcd(const String& text, bool clearFirst, uint16_t c
     setLcdBacklight(true);
 
     if (clearFirst) {
-        tft_.fillScreen(ST77XX_BLACK);
+        tft_.fillScreen(0x0000);
         tft_.setCursor(0, 0);
     }
 
     tft_.setTextColor(color);
-    tft_.println(text);
+    tft_.println(text.c_str());
     return true;
 }
 
@@ -248,191 +205,11 @@ bool DonglePeripherals::clearLcd(uint16_t color) {
     return true;
 }
 
-bool DonglePeripherals::beginSd(bool oneBitMode) {
-    sdReady_ = false;
-    sdOneBitMode_ = oneBitMode;
-    sdFrequencyKHz_ = 0;
-
-    // SD_MMC.setPins only works before begin(), so always unmount first.
-    SD_MMC.end();
-    delay(20);
-
-    // Software pull-ups help, but external pull-ups are still recommended.
-    pinMode(BoardConfig::PIN_SDMMC_CMD, INPUT_PULLUP);
-    pinMode(BoardConfig::PIN_SDMMC_D0, INPUT_PULLUP);
-    pinMode(BoardConfig::PIN_SDMMC_D1, INPUT_PULLUP);
-    pinMode(BoardConfig::PIN_SDMMC_D2, INPUT_PULLUP);
-    pinMode(BoardConfig::PIN_SDMMC_D3, INPUT_PULLUP);
-
-    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_CMD));
-    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D0));
-    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D1));
-    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D2));
-    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D3));
-
-#if defined(ESP32)
-    auto setSdPins = [](bool mode1bit) -> bool {
-        if (mode1bit) {
-            return SD_MMC.setPins(
-                BoardConfig::PIN_SDMMC_CLK,
-                BoardConfig::PIN_SDMMC_CMD,
-                BoardConfig::PIN_SDMMC_D0
-            );
-        }
-
-        return SD_MMC.setPins(
-            BoardConfig::PIN_SDMMC_CLK,
-            BoardConfig::PIN_SDMMC_CMD,
-            BoardConfig::PIN_SDMMC_D0,
-            BoardConfig::PIN_SDMMC_D1,
-            BoardConfig::PIN_SDMMC_D2,
-            BoardConfig::PIN_SDMMC_D3
-        );
-    };
-#endif
-
-    struct SdAttempt {
-        bool mode1bit;
-        int frequencyKHz;
-    };
-
-    SdAttempt attempts[4] = {};
-    size_t attemptsCount = 0;
-
-    if (oneBitMode) {
-        attempts[0] = {true, SDMMC_FREQ_DEFAULT};
-        attempts[1] = {true, SDMMC_FREQ_PROBING};
-        attemptsCount = 2;
-    } else {
-        // Try stable 1-bit first to avoid noisy init failures on weak signal cards.
-        attempts[0] = {true, SDMMC_FREQ_DEFAULT};
-        attempts[1] = {false, SDMMC_FREQ_DEFAULT};
-        attempts[2] = {true, SDMMC_FREQ_PROBING};
-        attempts[3] = {false, SDMMC_FREQ_PROBING};
-        attemptsCount = 4;
-    }
-
-    for (size_t i = 0; i < attemptsCount; ++i) {
-        const SdAttempt& attempt = attempts[i];
-
-        SD_MMC.end();
-        delay(20);
-
-#if defined(ESP32)
-        if (!setSdPins(attempt.mode1bit)) {
-            continue;
-        }
-#endif
-
-        if (!SD_MMC.begin("/sdcard", attempt.mode1bit, true, attempt.frequencyKHz)) {
-            continue;
-        }
-
-        // Accept only successful mount with a detected card.
-        if (SD_MMC.cardType() == CARD_NONE) {
-            SD_MMC.end();
-            continue;
-        }
-
-        sdReady_ = true;
-        sdOneBitMode_ = attempt.mode1bit;
-        sdFrequencyKHz_ = static_cast<uint32_t>(attempt.frequencyKHz);
-        return true;
-    }
-
-    ShellOutput::printTagged(Serial, "dongle", "SD init falhou (tentou 4-bit/1-bit e clock reduzido)");
-    return false;
-}
-
-bool DonglePeripherals::isSdReady() const {
-    return sdReady_;
-}
-
-bool DonglePeripherals::sdOneBitMode() const {
-    return sdOneBitMode_;
-}
-
-uint32_t DonglePeripherals::sdFrequencyKHz() const {
-    return sdFrequencyKHz_;
-}
-
-String DonglePeripherals::sdCardTypeName() const {
-    if (!sdReady_) {
-        return "NONE";
-    }
-
-    const uint8_t cardType = SD_MMC.cardType();
-    if (cardType == CARD_MMC) {
-        return "MMC";
-    }
-    if (cardType == CARD_SD) {
-        return "SDSC";
-    }
-    if (cardType == CARD_SDHC) {
-        return "SDHC";
-    }
-
-    return "UNKNOWN";
-}
-
-uint64_t DonglePeripherals::sdTotalMB() const {
-    return sdTotalBytes() / (1024ULL * 1024ULL);
-}
-
-uint64_t DonglePeripherals::sdTotalBytes() const {
-    if (!sdReady_) {
-        return 0;
-    }
-
-    return SD_MMC.totalBytes();
-}
-
-uint64_t DonglePeripherals::sdUsedMB() const {
-    return sdUsedBytes() / (1024ULL * 1024ULL);
-}
-
-uint64_t DonglePeripherals::sdUsedBytes() const {
-    if (!sdReady_) {
-        return 0;
-    }
-
-    return SD_MMC.usedBytes();
-}
-
-bool DonglePeripherals::wipeSdContents() {
-    if (!sdReady_) {
-        return false;
-    }
-
-    File root = SD_MMC.open("/");
-    if (!root || !root.isDirectory()) {
-        return false;
-    }
-
-    File entry = root.openNextFile();
-    while (entry) {
-        String entryPath = normalizeFsPath(String(entry.name()));
-        const bool entryIsDir = entry.isDirectory();
-        entry.close();
-
-        const bool ok = entryIsDir ? removeTree(SD_MMC, entryPath) : SD_MMC.remove(entryPath);
-        if (!ok) {
-            root.close();
-            return false;
-        }
-
-        entry = root.openNextFile();
-    }
-
-    root.close();
-    return true;
-}
-
 void DonglePeripherals::sendLedByte(uint8_t value) const {
     for (int8_t bit = 7; bit >= 0; --bit) {
-        digitalWrite(BoardConfig::PIN_LED_DI, (value & (1U << bit)) ? HIGH : LOW);
-        digitalWrite(BoardConfig::PIN_LED_CI, HIGH);
-        digitalWrite(BoardConfig::PIN_LED_CI, LOW);
+        gpio_set_level(BoardConfig::PIN_LED_DI, (value & (1U << bit)) ? 1 : 0);
+        gpio_set_level(BoardConfig::PIN_LED_CI, 1);
+        gpio_set_level(BoardConfig::PIN_LED_CI, 0);
     }
 }
 

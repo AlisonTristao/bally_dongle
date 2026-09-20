@@ -1,7 +1,13 @@
 #include "EspNowManager.h"
 
-#include <WiFi.h>
+#include "compat.h"
+
+#include <atomic>
 #include <cstring>
+
+#include <esp_event.h>
+#include <esp_netif.h>
+#include <nvs_flash.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -46,14 +52,6 @@ constexpr std::uint32_t kAsyncCallbackTimeoutMs = 60U;
 // pass; now the worst case per lost callback is 160 ms (60 + 100).
 constexpr std::uint32_t kLateCallbackGraceMs = 100U;
 
-// Standard 802.11 MAC header: frame control at offset 0-1, then three 6-byte
-// address fields for a management frame at offsets 4, 10, 16. Address2 (10)
-// is the transmitter. Frame control byte 0 == 0xD0 is Version=0, Type=
-// Management(00), Subtype=Action(1101) -- what every ESP-NOW frame is sent
-// as, regardless of the flags in byte 1.
-constexpr std::uint8_t kDot11FrameControlMgmtAction = 0xD0U;
-constexpr std::size_t kDot11Addr2Offset = 10U;
-
 struct TxRequest {
     std::uint8_t mac[6];
     std::uint16_t len;
@@ -83,11 +81,18 @@ TaskHandle_t g_txWorkerTask = nullptr;
 volatile bool g_txWorkerRunning = false;
 CompletionSlot g_completionSlots[kCompletionSlotCount];
 portMUX_TYPE g_completionMux = portMUX_INITIALIZER_UNLOCKED;
-volatile std::uint32_t g_txEnqueued[kTxPriorityCount] = {0U, 0U, 0U};
-volatile std::uint32_t g_txDroppedQueueFull[kTxPriorityCount] = {0U, 0U, 0U};
-volatile std::uint32_t g_txDriverRejected = 0U;
-volatile std::uint32_t g_txCallbackTimeouts = 0U;
-volatile std::uint32_t g_txCallbacksReceived = 0U;
+// std::atomic, not `volatile` (ESP-IDF migration, PLANO_ESPIDF_DONGLE.md
+// phase 3): GCC 15's `-Werror=volatile` rejects `++` on volatile (deprecated
+// in C++20). atomic is the correct replacement, not a warning-silencer --
+// volatile never made cross-task increments atomic, only stopped the
+// compiler from caching the value in a register. g_txWorkerRunning above
+// stays `volatile bool`: nothing here does a compound op on it, only plain
+// reads/assignments, which are not affected by this deprecation.
+std::atomic<std::uint32_t> g_txEnqueued[kTxPriorityCount] = {};
+std::atomic<std::uint32_t> g_txDroppedQueueFull[kTxPriorityCount] = {};
+std::atomic<std::uint32_t> g_txDriverRejected{0U};
+std::atomic<std::uint32_t> g_txCallbackTimeouts{0U};
+std::atomic<std::uint32_t> g_txCallbacksReceived{0U};
 
 std::size_t priorityIndex(EspNowManager::TxPriority priority) noexcept {
     const std::size_t index = static_cast<std::size_t>(priority);
@@ -359,15 +364,52 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     channel_ = channel;
     encrypt_ = encrypt;
 
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    // Native Wi-Fi STA bring-up (ESP-IDF migration, PLANO_ESPIDF_DONGLE.md
+    // phase 3), replacing what arduino-esp32's WiFi.mode(WIFI_STA)/
+    // WiFi.disconnect() used to do under the hood. Mirrors bally_OS's own
+    // ROBOT::configureCommunication() (BallyRobot.cpp) -- the Wi-Fi driver
+    // needs NVS for calibration data before esp_wifi_init() will succeed,
+    // and this dongle has no earlier boot step that already did that (phase
+    // 4/DongleKeyStore's own nvs_flash_init() becomes a harmless no-op once
+    // this one already ran).
+    esp_err_t nvsResult = nvs_flash_init();
+    if (nvsResult == ESP_ERR_NVS_NO_FREE_PAGES || nvsResult == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvsResult = nvs_flash_init();
+    }
+    if (nvsResult != ESP_OK) {
+        initialized_ = false;
+        return false;
+    }
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    // Not strictly needed for ESP-NOW alone (no DHCP client on this side of
+    // the link), but esp_wifi_start() expects the default STA netif to
+    // exist -- same ordering bally_OS's configureCommunication() documents.
+    if (esp_netif_create_default_wifi_sta() == nullptr) {
+        initialized_ = false;
+        return false;
+    }
+
+    wifi_init_config_t wifiInitConfig = WIFI_INIT_CONFIG_DEFAULT();
+    if (esp_wifi_init(&wifiInitConfig) != ESP_OK) {
+        initialized_ = false;
+        return false;
+    }
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+
+    if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_start() != ESP_OK) {
+        initialized_ = false;
+        return false;
+    }
 
     // Default modem sleep lets the radio doze between beacons, adding
     // latency to both TX and RX -- same reasoning and same fix as
     // bally_OS's own esp_wifi_set_ps(WIFI_PS_NONE) (BallyRobot.cpp,
     // configureCommunication()). This side of the link never had it applied
     // at all until now.
-    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     // peerInfo.channel below (0 = "current channel") only WORKS if the radio
     // is actually already on the channel a peer expects -- esp_now_add_peer()
@@ -384,13 +426,14 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
 
     // A fixed, explicit rate instead of the driver's default (legacy
     // 802.11b, ~1 Mbps): shrinks per-frame airtime on every peer this
-    // interface talks to. Interface-wide (unlike bally_OS's per-peer
-    // esp_now_set_peer_rate_config -- this core's ESP-NOW predates that
-    // API), so one call here covers every current and future peer, no
-    // per-peer follow-up needed. MCS5_SGI matches the rate configured on
-    // the robot side (BallyRobot.cpp, configureCommunication()); walk both
-    // up together if bench margin allows it.
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS5_SGI);
+    // interface talks to. ESP-IDF migration phase 3: the arduino-esp32-only
+    // `esp_wifi_config_espnow_rate()` interface-wide call this used to be
+    // does not exist under real ESP-IDF (6.0.1 here) -- esp_now.h only ever
+    // had the PER-PEER `esp_now_set_peer_rate_config()`, same as bally_OS
+    // already uses (BallyRobot.cpp, configureCommunication()). Applied in
+    // addPeerToEspNow() below, once per peer, after esp_now_add_peer().
+    // MCS5_SGI matches the rate configured on the robot side; walk both up
+    // together if bench margin allows it.
 
     initialized_ = true;
     activeInstance_ = this;
@@ -398,16 +441,6 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     // Bind static handlers, then restore already registered peers.
     esp_now_register_recv_cb(handleReceiveStatic);
     esp_now_register_send_cb(handleSendStatic);
-
-    // See handlePromiscuousRxStatic: this core's ESP-NOW recv callback has no
-    // RSSI, so a promiscuous sniffer runs alongside it to recover one.
-    // Management-frame-only filter, since ESP-NOW's Action frames are all
-    // this dongle ever needs to see on its own fixed channel.
-    wifi_promiscuous_filter_t promiscFilter{};
-    promiscFilter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-    esp_wifi_set_promiscuous_filter(&promiscFilter);
-    esp_wifi_set_promiscuous_rx_cb(handlePromiscuousRxStatic);
-    esp_wifi_set_promiscuous(true);
 
     if (!startTxScheduler()) {
         esp_now_deinit();
@@ -434,7 +467,6 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
 void EspNowManager::end() {
     stopTxScheduler();
     if (initialized_) {
-        esp_wifi_set_promiscuous(false);
         esp_now_deinit();
     }
     destroyTxSchedulerStorage();
@@ -730,43 +762,43 @@ void EspNowManager::setSendCallback(SendCallback callback) {
 
 // Forward the raw ESP-NOW datagram to the instance callback unmodified; this
 // class has no protocol knowledge, so bounds are the only thing checked here.
-void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incomingData, int len) {
+//
+// ESP-IDF migration phase 3: arduino-esp32's esp_now_recv_cb_t predated
+// esp_now_recv_info_t and carried no RSSI, which is why this used to run a
+// whole parallel Wi-Fi promiscuous-mode sniffer (handlePromiscuousRxStatic,
+// dot11 header parsing and all) just to recover one. Real ESP-IDF's
+// esp_now_recv_info_t::rx_ctrl already has it directly on every callback --
+// same field (wifi_pkt_rx_ctrl_t::rssi) the sniffer used to read off a
+// second copy of the same over-the-air frame -- so that whole workaround is
+// gone, not just adapted; bally_OS's own handleReceiveStatic (BallyRobot.cpp)
+// already takes esp_now_recv_info_t the same way.
+void EspNowManager::handleReceiveStatic(const esp_now_recv_info_t* info, const uint8_t* incomingData, int len) {
     if (activeInstance_ == nullptr || activeInstance_->receiveCallback_ == nullptr ||
+        info == nullptr || info->src_addr == nullptr ||
         incomingData == nullptr || len <= 0 || len > static_cast<int>(MAX_DATA_LEN)) {
         return;
     }
 
+    const uint8_t* mac = info->src_addr;
+    const int8_t rssi = (info->rx_ctrl != nullptr) ? static_cast<int8_t>(info->rx_ctrl->rssi) : int8_t(-128);
+
     const int index = activeInstance_->findDeviceIndexByMac(mac);
-    const int8_t rssi = (index >= 0) ? activeInstance_->devices_[index].lastRssi : int8_t(-128);
+    if (index >= 0) {
+        activeInstance_->devices_[index].lastRssi = rssi;
+    }
+
     activeInstance_->receiveCallback_(mac, incomingData, static_cast<size_t>(len), rssi);
 }
 
-// See handlePromiscuousRxStatic's doc comment (EspNowManager.h): this stashes
-// the RSSI of the last Action frame seen from each known peer, so
-// handleReceiveStatic can read it back for that same over-the-air frame.
-void EspNowManager::handlePromiscuousRxStatic(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (activeInstance_ == nullptr || type != WIFI_PKT_MGMT || buf == nullptr) {
-        return;
-    }
-
-    const auto* pkt = static_cast<const wifi_promiscuous_pkt_t*>(buf);
-    if (pkt->rx_ctrl.sig_len < kDot11Addr2Offset + 6U ||
-        pkt->payload[0] != kDot11FrameControlMgmtAction) {
-        return;
-    }
-
-    const uint8_t* sourceMac = pkt->payload + kDot11Addr2Offset;
-    const int index = activeInstance_->findDeviceIndexByMac(sourceMac);
-    if (index >= 0) {
-        activeInstance_->devices_[index].lastRssi = static_cast<int8_t>(pkt->rx_ctrl.rssi);
-    }
-}
-
-// Dispatch low-level send result to user callback.
-void EspNowManager::handleSendStatic(const uint8_t* mac, esp_now_send_status_t status) {
+// Dispatch low-level send result to user callback. esp_now_send_info_t (real
+// ESP-IDF) carries the peer MAC as des_addr, same role arduino-esp32's bare
+// `const uint8_t* mac` parameter used to play directly.
+void EspNowManager::handleSendStatic(const esp_now_send_info_t* txInfo, esp_now_send_status_t status) {
     if (activeInstance_ == nullptr) {
         return;
     }
+
+    const uint8_t* mac = (txInfo != nullptr) ? txInfo->des_addr : nullptr;
 
     if (g_driverStatusQueue != nullptr && mac != nullptr) {
         DriverStatus driverStatus{};
@@ -793,7 +825,21 @@ bool EspNowManager::addPeerToEspNow(const uint8_t mac[6]) const {
     peerInfo.channel = channel_;
     peerInfo.encrypt = encrypt_;
 
-    return esp_now_add_peer(&peerInfo) == ESP_OK;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        return false;
+    }
+
+    // Per-peer rate config (see begin()'s comment): real ESP-IDF has no
+    // interface-wide equivalent of arduino-esp32's esp_wifi_config_espnow_rate,
+    // only esp_now_set_peer_rate_config(). Best-effort -- a failure here
+    // just leaves this one peer on the driver's default legacy 802.11b rate,
+    // not a reason to fail peer registration outright.
+    esp_now_rate_config_t rateConfig = {};
+    rateConfig.phymode = WIFI_PHY_MODE_HT20;
+    rateConfig.rate = WIFI_PHY_RATE_MCS5_SGI;
+    esp_now_set_peer_rate_config(mac, &rateConfig);
+
+    return true;
 }
 
 // Remove peer from ESP-NOW runtime table.

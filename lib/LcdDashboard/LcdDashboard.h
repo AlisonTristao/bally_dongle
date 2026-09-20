@@ -1,12 +1,19 @@
 #pragma once
 
-#include <Arduino.h>
-#include <Adafruit_ST7735.h>
+#include <cstdint>
+#include <string>
 
 #include <DonglePeripherals.h>
 
 /**
  * @brief Paged status dashboard rendered on the ST7735 LCD (160x80).
+ *
+ * ESP-IDF migration, phase 7 (PLANO_ESPIDF_DONGLE.md secao 6, D1): ported
+ * against DongleLcd (LovyanGFX) instead of Adafruit_ST7735 -- every drawing
+ * call below has a same-named LovyanGFX equivalent except getTextBounds(),
+ * replaced by textWidth()+fontHeight() (LovyanGFX's built-in font draws
+ * from an exact top-left origin, so there is no Adafruit-GFX-style x1/y1
+ * glyph-origin correction to carry over).
  *
  * Replaces the old scrolling text terminal (and, later, the old single-grid
  * dashboard): the same text is already available on the serial console and
@@ -91,7 +98,7 @@ public:
      * feedback) in the message banner. Draws immediately, color as given
      * (no panel-color correction here; callers decide, same as before).
      */
-    void showMessage(const String& text, uint16_t color);
+    void showMessage(const std::string& text, uint16_t color);
 
     /** Pulses the RX tile; call once per received ESP-NOW message. */
     void notifyRx();
@@ -106,7 +113,7 @@ public:
      * run -> green, otherwise neutral), same heuristic spirit as command
      * feedback coloring elsewhere in the shell.
      */
-    void notifyRobotState(const String& state);
+    void notifyRobotState(const std::string& state);
 
     /**
      * @brief Latest peer table snapshot: up to MAX_DISPLAYED_PEERS rows for
@@ -154,7 +161,7 @@ private:
         bool dbReady;
     };
 
-    Adafruit_ST7735* tft_;
+    DongleLcd* tft_;
     bool ready_;
 
     int16_t screenW_;
@@ -238,7 +245,7 @@ private:
 
     Rect valueArea(const Rect& tile) const;
     void drawLabel(const Rect& tile, const char* label);
-    void drawCenteredValue(const Rect& tile, const String& text, uint16_t color, uint8_t textSize);
+    void drawCenteredValue(const Rect& tile, const std::string& text, uint16_t color, uint8_t textSize);
     void drawActivityDot(const Rect& tile, const char* label, uint16_t color);
-    void drawTextLine(int16_t x, int16_t y, const String& text, uint16_t color);
+    void drawTextLine(int16_t x, int16_t y, const std::string& text, uint16_t color);
 };

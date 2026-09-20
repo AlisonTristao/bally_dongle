@@ -1,0 +1,53 @@
+# FreeRTOS / CPU
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
+# AppRuntime::tick() nests fairly deep frames (RoutedMessage, log text[617],
+# frameBytes[2088], QueuedFrame{}) even before the shell/SQLite calls that
+# also run every tick add their own -- same reasoning as the old
+# getArduinoLoopTaskStackSize()=16384 override this migration replaces (see
+# src/main.cpp). app_main() itself is the task that runs AppRuntime::tick(),
+# so it inherits this stack, not the default 3584.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# T-Dongle-S3 has no PSRAM (confirmed on the bench, topico 33) -- no
+# CONFIG_SPIRAM here, unlike bally_OS's sdkconfig.defaults.
+
+# Console/logs (decisao D4, REVISADA 2026-09-20 -- era UART0 no header,
+# trocado pra USB-Serial/JTAG nativo depois que ler o log real por aqui foi
+# o que achou os dois bugs reais da fase 5 -- ver a nota de memoria
+# pio-core-conflict-fortrancommon.md). Mesma porta COM ja usada pra
+# flashear, sem precisar de adaptador UART externo pra depurar. Continua
+# sendo um controlador USB DIFERENTE do CDC-ACM composto que a fase 6 traz
+# (esp_tinyusb, pino USB OTG) -- nao deveria competir com shell+BTP, mas
+# revalidar isso quando a fase 6 chegar.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# UART0 no header (GPIO43/44) e a alternativa, caso o console via USB volte a
+# ser trocado no futuro:
+# CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# CONFIG_ESP_CONSOLE_UART_NUM=0
+
+# OTA/rollback intentionally NOT enabled here (decisao D3): this migration
+# ships a single `factory` partition (see partitions.csv). Revisit only if
+# OTA becomes a real product need later.
+
+# Composite USB device (phase 6, PLANO_ESPIDF_DONGLE.md secao 7): esp_tinyusb
+# needs CDC_ENABLED/COUNT and HID_COUNT>0 to compile the CDC and HID class
+# drivers into the TinyUSB stack (CFG_TUD_CDC/CFG_TUD_HID in
+# managed_components/espressif__esp_tinyusb/include/tusb_config.h). The
+# actual composite descriptor (device+config+strings+HID report descriptor)
+# is hand-built in lib/Compat/UsbComposite.cpp instead of using
+# esp_tinyusb's own Kconfig-driven generator -- that generator never wires
+# up HID at all, so its CONFIG_TINYUSB_DESC_*/MSC_* string options are not
+# used here.
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+# 1 KB (plan sec. 7, item 3) -- default 512 was sized for a single-purpose
+# CDC-only device, not shell+BTP sharing the link with COBS-framed binary
+# frames that can burst ahead of SerialMux draining them one tick at a time.
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=1024
+CONFIG_TINYUSB_HID_COUNT=1

@@ -3,3 +3,10 @@
 .venv
 .txt
 __pycache__
+
+# ESP-IDF component manager output (phase 6, esp_tinyusb via
+# src/idf_component.yml) -- regenerated from dependencies.lock (tracked) on
+# every build, same convention bally_OS already uses for its own
+# managed_components/.
+/managed_components/
+/build/

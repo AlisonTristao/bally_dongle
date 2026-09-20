@@ -4,6 +4,8 @@
 
 #if defined(ARDUINO)
 #include <Preferences.h>
+#elif defined(ESP_PLATFORM)
+#include <nvs.h>
 #endif
 
 namespace DongleKeyStore {
@@ -319,6 +321,64 @@ bool loadFromNvs() noexcept {
     return true;
 }
 
-#endif  // defined(ARDUINO)
+#elif defined(ESP_PLATFORM)
+
+// ESP-IDF migration, phase 4 (PLANO_ESPIDF_DONGLE.md): Arduino's Preferences
+// is itself just a thin wrapper over exactly these nvs_* calls (same
+// namespace/key-as-blob model) -- this is a direct, same-shape port, not a
+// redesign. Requires nvs_flash_init() to already have run once (today: as a
+// side effect of EspNowManager::begin(), phase 3); nvs_open() fails closed
+// with ESP_ERR_NVS_NOT_INITIALIZED otherwise, which saveToNvs()/loadFromNvs()
+// below already treat as an ordinary failure.
+
+namespace {
+constexpr const char* kNvsNamespace = "ballykey";
+constexpr const char* kNvsKeyName = "key_l";
+}  // namespace
+
+bool saveToNvs() noexcept {
+    if (!g_hasKeyL) {
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+        return false;
+    }
+
+    const esp_err_t setResult = nvs_set_blob(handle, kNvsKeyName, g_keyL, kKeyLength);
+    const esp_err_t commitResult = (setResult == ESP_OK) ? nvs_commit(handle) : setResult;
+    nvs_close(handle);
+    return commitResult == ESP_OK;
+}
+
+bool loadFromNvs() noexcept {
+    nvs_handle_t handle = 0;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+
+    std::size_t storedSize = 0U;
+    if (nvs_get_blob(handle, kNvsKeyName, nullptr, &storedSize) != ESP_OK ||
+        storedSize != kKeyLength) {
+        nvs_close(handle);
+        return false;
+    }
+
+    std::uint8_t loaded[kKeyLength] = {};
+    std::size_t readSize = kKeyLength;
+    const esp_err_t readResult = nvs_get_blob(handle, kNvsKeyName, loaded, &readSize);
+    nvs_close(handle);
+    if (readResult != ESP_OK || readSize != kKeyLength) {
+        wipe(loaded, sizeof(loaded));
+        return false;
+    }
+
+    setKeyL(loaded);
+    wipe(loaded, sizeof(loaded));
+    return true;
+}
+
+#endif  // defined(ARDUINO) / defined(ESP_PLATFORM)
 
 }  // namespace DongleKeyStore

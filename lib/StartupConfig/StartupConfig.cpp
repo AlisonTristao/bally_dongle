@@ -5,15 +5,15 @@
 namespace {
 
 void showBootStatusOnLcd(DonglePeripherals& peripherals) {
-    Adafruit_ST7735* lcd = peripherals.lcd();
+    DongleLcd* lcd = peripherals.lcd();
     if (lcd == nullptr) {
         return;
     }
 
     // Keep the same calibrated color pair previously used in beginLcd
     // (panel on this board has inverted visual polarity in practice).
-    constexpr uint16_t kStatusBg = ST77XX_WHITE;
-    constexpr uint16_t kStatusFg = ST77XX_BLACK;
+    constexpr uint16_t kStatusBg = 0xFFFF;
+    constexpr uint16_t kStatusFg = 0x0000;
 
     const char* line1 = "bally dongle";
     const char* line2 = "iniciando...";
@@ -27,11 +27,14 @@ void showBootStatusOnLcd(DonglePeripherals& peripherals) {
     const char* lines[2] = {line1, line2};
     uint16_t widths[2] = {0, 0};
     uint16_t heights[2] = {0, 0};
-    int16_t x1 = 0;
-    int16_t y1 = 0;
 
+    // LovyanGFX's built-in font draws from an exact top-left origin (no
+    // Adafruit-GFX-style getTextBounds() x1/y1 glyph-origin correction
+    // needed) -- textWidth()/fontHeight() already account for the size set
+    // above.
     for (size_t i = 0; i < 2; ++i) {
-        lcd->getTextBounds(lines[i], 0, 0, &x1, &y1, &widths[i], &heights[i]);
+        widths[i] = static_cast<uint16_t>(lcd->textWidth(lines[i]));
+        heights[i] = static_cast<uint16_t>(lcd->fontHeight());
         if (heights[i] == 0) {
             heights[i] = 8;
         }
@@ -60,7 +63,7 @@ void showBootStatusOnLcd(DonglePeripherals& peripherals) {
 
 namespace StartupConfig{
 
-void announceBoot(DonglePeripherals& peripherals) {
+void announceBoot(DonglePeripherals& peripherals, ByteIO& io) {
     // Previously blocked here (while(!Serial)) until the host asserted DTR
     // on the USB CDC port, so a terminal attaching after power-on wouldn't
     // miss early boot output. Only interactive terminals (Arduino Serial
@@ -74,7 +77,7 @@ void announceBoot(DonglePeripherals& peripherals) {
 
     showBootStatusOnLcd(peripherals);
 
-    ShellOutput::printTagged(Serial, "startup", "iniciando...");
+    ShellOutput::printTagged(io, "startup", "iniciando...");
 
     peripherals.ledOff();
 }

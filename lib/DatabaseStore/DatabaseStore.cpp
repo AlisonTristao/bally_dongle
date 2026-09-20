@@ -1,14 +1,31 @@
 #include "DatabaseStore.h"
 
-#include <SD_MMC.h>
 #include <sqlite3.h>
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/stat.h>
+
+#include "string_compat.h"
 
 namespace {
+
+// SD_MMC.exists(path) / (SD_MMC.open(path) then .isDirectory()) equivalents:
+// under POSIX every path (SD, sqlite, bootstrap script) is just an absolute
+// path through the VFS, so a stat() is enough -- no need to actually open
+// anything just to answer "does this exist / is this a directory".
+bool sdPathExists(const char* path) {
+    struct stat st;
+    return ::stat(path, &st) == 0;
+}
+
+bool sdPathIsDirectory(const char* path) {
+    struct stat st;
+    return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
 
 constexpr const char* kDefaultBootstrapSql = R"SQL(
 CREATE TABLE IF NOT EXISTS peers (
@@ -60,7 +77,7 @@ CREATE TABLE IF NOT EXISTS kv_store (
 )SQL";
 
 struct QueryTextContext {
-    String* out;
+    std::string* out;
     size_t rowCount;
     size_t maxRows;
     bool truncated;
@@ -77,24 +94,24 @@ int queryTextCallback(void* rawContext, int argc, char** argv, char** colNames) 
         return 1;
     }
 
-    context->out->concat("[");
-    context->out->concat(static_cast<unsigned long>(context->rowCount + 1));
-    context->out->concat("] ");
+    *context->out += "[";
+    *context->out += std::to_string(static_cast<unsigned long>(context->rowCount + 1));
+    *context->out += "] ";
 
     for (int i = 0; i < argc; ++i) {
         if (i > 0) {
-            context->out->concat(" | ");
+            *context->out += " | ";
         }
 
         const char* columnName = (colNames != nullptr && colNames[i] != nullptr) ? colNames[i] : "col";
         const char* value = (argv != nullptr && argv[i] != nullptr) ? argv[i] : "NULL";
 
-        context->out->concat(columnName);
-        context->out->concat("=");
-        context->out->concat(value);
+        *context->out += columnName;
+        *context->out += "=";
+        *context->out += value;
     }
 
-    context->out->concat("\n");
+    *context->out += "\n";
     ++context->rowCount;
     return 0;
 }
@@ -108,11 +125,11 @@ struct IntQueryContext {
 // site only ever logs the shell one-liner text sent by "espnow -send_to/
 // -send_all" (see EspNowCommands.cpp), never a raw BTP envelope, but is kept
 // byte-safe (control bytes escaped, hard length cap) in case that changes.
-String payloadPreviewText(const uint8_t* payload, size_t payloadSize) {
+std::string payloadPreviewText(const uint8_t* payload, size_t payloadSize) {
     constexpr size_t kPreviewCap = 256;
     const size_t length = (payloadSize < kPreviewCap) ? payloadSize : kPreviewCap;
 
-    String out;
+    std::string out;
     out.reserve(length + 4);
     for (size_t i = 0; i < length; ++i) {
         const uint8_t byte = (payload != nullptr) ? payload[i] : 0;
@@ -135,7 +152,7 @@ int queryIntCallback(void* rawContext, int argc, char** argv, char**) {
     return 0;
 }
 
-String safeColumnText(sqlite3_stmt* stmt, int columnIndex) {
+std::string safeColumnText(sqlite3_stmt* stmt, int columnIndex) {
     if (stmt == nullptr) {
         return "";
     }
@@ -145,10 +162,10 @@ String safeColumnText(sqlite3_stmt* stmt, int columnIndex) {
         return "";
     }
 
-    return String(reinterpret_cast<const char*>(value));
+    return std::string(reinterpret_cast<const char*>(value));
 }
 
-String epochToDateTimeText(int64_t epoch) {
+std::string epochToDateTimeText(int64_t epoch) {
     if (epoch <= 0) {
         return "(sem-data)";
     }
@@ -161,11 +178,11 @@ String epochToDateTimeText(int64_t epoch) {
 
     char out[24] = {0};
     std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &localTime);
-    return String(out);
+    return std::string(out);
 }
 
-String sanitizeAndTruncateField(const String& input, size_t maxLen) {
-    String out;
+std::string sanitizeAndTruncateField(const std::string& input, size_t maxLen) {
+    std::string out;
     out.reserve((maxLen > 0 ? maxLen : 1) + 8);
 
     const size_t inputLen = input.length();
@@ -187,8 +204,8 @@ String sanitizeAndTruncateField(const String& input, size_t maxLen) {
         }
     }
 
-    out.trim();
-    if (out.isEmpty()) {
+    strcompat::trim(out);
+    if (out.empty()) {
         return "(vazio)";
     }
 
@@ -222,7 +239,7 @@ void DatabaseStore::unlockDb() {
     }
 }
 
-bool DatabaseStore::begin(Stream* io) {
+bool DatabaseStore::begin(ByteIO* io) {
     io_ = io;
     ready_ = false;
 
@@ -266,7 +283,7 @@ bool DatabaseStore::loadPeers(EspNowManager& espNow) {
 bool DatabaseStore::rebuild(EspNowManager& espNow) {
     closeDatabase();
 
-    if (SD_MMC.exists(kFsDatabasePath) && !SD_MMC.remove(kFsDatabasePath)) {
+    if (sdPathExists(kDatabasePath) && std::remove(kDatabasePath) != 0) {
         logLine("[database] falha ao remover banco anterior");
         return false;
     }
@@ -284,7 +301,7 @@ bool DatabaseStore::rebuild(EspNowManager& espNow) {
     return true;
 }
 
-bool DatabaseStore::backup(String& outText) {
+bool DatabaseStore::backup(std::string& outText) {
     outText = "";
 
     if (!ready_) {
@@ -292,13 +309,7 @@ bool DatabaseStore::backup(String& outText) {
         return false;
     }
 
-    File backupDir = SD_MMC.open(kFsBackupDir);
-    const bool hasBackupDir = backupDir && backupDir.isDirectory();
-    if (backupDir) {
-        backupDir.close();
-    }
-
-    if (!hasBackupDir && !SD_MMC.mkdir(kFsBackupDir)) {
+    if (!sdPathIsDirectory(kBackupDir) && ::mkdir(kBackupDir, 0775) != 0) {
         outText = "[database] falha ao criar pasta de backup";
         return false;
     }
@@ -313,22 +324,20 @@ bool DatabaseStore::backup(String& outText) {
         std::snprintf(timestamp, sizeof(timestamp), "epoch_%lld", static_cast<long long>(nowEpoch));
     }
 
-    const String baseName = String("dongle_") + timestamp;
-    String fsBackupPath = String(kFsBackupDir) + "/" + baseName + ".db";
+    const std::string baseName = std::string("dongle_") + timestamp;
+    std::string backupPath = std::string(kBackupDir) + "/" + baseName + ".db";
     int suffix = 1;
-    while (SD_MMC.exists(fsBackupPath) && suffix < 1000) {
+    while (sdPathExists(backupPath.c_str()) && suffix < 1000) {
         char suffixText[8] = {0};
         std::snprintf(suffixText, sizeof(suffixText), "_%03d", suffix);
-        fsBackupPath = String(kFsBackupDir) + "/" + baseName + suffixText + ".db";
+        backupPath = std::string(kBackupDir) + "/" + baseName + suffixText + ".db";
         ++suffix;
     }
 
-    if (SD_MMC.exists(fsBackupPath)) {
+    if (sdPathExists(backupPath.c_str())) {
         outText = "[database] falha ao gerar nome unico para backup";
         return false;
     }
-
-    const String sqliteBackupPath = String("/sdcard") + fsBackupPath;
 
     if (!lockDb(5000)) {
         outText = "[database] lock indisponivel para backup";
@@ -348,7 +357,7 @@ bool DatabaseStore::backup(String& outText) {
     }
 
     sqlite3* backupDb = nullptr;
-    const int openRc = sqlite3_open(sqliteBackupPath.c_str(), &backupDb);
+    const int openRc = sqlite3_open(backupPath.c_str(), &backupDb);
     if (openRc != SQLITE_OK || backupDb == nullptr) {
         if (backupDb != nullptr) {
             sqlite3_close(backupDb);
@@ -374,16 +383,15 @@ bool DatabaseStore::backup(String& outText) {
 
     const bool copied = (stepRc == SQLITE_DONE) && (finishRc == SQLITE_OK) && (destErr == SQLITE_OK);
     if (!copied) {
-        SD_MMC.remove(fsBackupPath);
+        std::remove(backupPath.c_str());
         outText = "[database] falha ao gerar backup";
         return false;
     }
 
     uint64_t backupBytes = 0;
-    File backupFile = SD_MMC.open(fsBackupPath, FILE_READ);
-    if (backupFile) {
-        backupBytes = static_cast<uint64_t>(backupFile.size());
-        backupFile.close();
+    struct stat backupStat;
+    if (::stat(backupPath.c_str(), &backupStat) == 0) {
+        backupBytes = static_cast<uint64_t>(backupStat.st_size);
     }
 
     char line[256] = {0};
@@ -391,7 +399,7 @@ bool DatabaseStore::backup(String& outText) {
         line,
         sizeof(line),
         "[database] backup salvo: %s (%lluB)",
-        fsBackupPath.c_str(),
+        backupPath.c_str(),
         static_cast<unsigned long long>(backupBytes)
     );
     outText = line;
@@ -412,18 +420,18 @@ bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const cha
     }
 
     const int64_t now = currentEpochSeconds();
-    const String macText = macToText(mac);
-    const String peerName = (name != nullptr) ? name : "";
-    const String peerDescription = (description != nullptr) ? description : "";
+    const std::string macText = macToText(mac);
+    const std::string peerName = (name != nullptr) ? name : "";
+    const std::string peerDescription = (description != nullptr) ? description : "";
 
-    String sql;
+    std::string sql;
     sql.reserve(520);
     sql += "UPDATE peers SET name='";
     sql += escapeSqlText(peerName);
     sql += "', description='";
     sql += escapeSqlText(peerDescription);
     sql += "', updated_at=";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += " WHERE mac='";
     sql += escapeSqlText(macText);
     sql += "';";
@@ -435,9 +443,9 @@ bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const cha
     sql += "','";
     sql += escapeSqlText(peerDescription);
     sql += "',";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ",";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ");";
 
     return executeNoResult(sql);
@@ -448,7 +456,7 @@ bool DatabaseStore::removePeer(const uint8_t mac[6]) {
         return false;
     }
 
-    String sql = "DELETE FROM peers WHERE mac='";
+    std::string sql = "DELETE FROM peers WHERE mac='";
     sql += escapeSqlText(macToText(mac));
     sql += "';";
 
@@ -466,14 +474,14 @@ bool DatabaseStore::updatePeerMetadata(const uint8_t mac[6], const char* name, c
     }
 
     const int64_t now = currentEpochSeconds();
-    String sql;
+    std::string sql;
     sql.reserve(320);
     sql += "UPDATE peers SET name='";
-    sql += escapeSqlText(String((name != nullptr) ? name : ""));
+    sql += escapeSqlText(std::string((name != nullptr) ? name : ""));
     sql += "', description='";
-    sql += escapeSqlText(String((description != nullptr) ? description : ""));
+    sql += escapeSqlText(std::string((description != nullptr) ? description : ""));
     sql += "', updated_at=";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += " WHERE mac='";
     sql += escapeSqlText(macToText(mac));
     sql += "';";
@@ -543,7 +551,7 @@ bool DatabaseStore::logCommandWithOutput(const char* command, const char* output
     }
 
     if (!ok) {
-        logLine(String("[database] SQL error: ") + sqlite3_errmsg(db_));
+        logLine(std::string("[database] SQL error: ") + sqlite3_errmsg(db_));
     }
 
     unlockDb();
@@ -561,11 +569,11 @@ bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], btp::MessageType typ
     }
 
     const int64_t now = currentEpochSeconds();
-    String sql;
+    std::string sql;
     sql.reserve(760);
     sql += "INSERT INTO espnow_outgoing_log(peer_id,mac,payload,payload_type,delivered,sent_at) VALUES(";
     if (peerId > 0) {
-        sql += String(static_cast<long>(peerId));
+        sql += std::to_string(static_cast<long>(peerId));
     } else {
         sql += "NULL";
     }
@@ -574,11 +582,11 @@ bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], btp::MessageType typ
     sql += "','";
     sql += escapeSqlText(payloadPreviewText(payload, payloadSize));
     sql += "',";
-    sql += String(static_cast<int>(type));
+    sql += std::to_string(static_cast<int>(type));
     sql += ",";
     sql += delivered ? "1" : "0";
     sql += ",";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ");";
 
     return executeNoResult(sql);
@@ -591,12 +599,12 @@ bool DatabaseStore::logBootEvent(const char* reason) {
 
     const int64_t now = currentEpochSeconds();
 
-    String sql;
+    std::string sql;
     sql.reserve(280);
     sql += "INSERT INTO boot_events(reason,boot_at) VALUES('";
-    sql += escapeSqlText(String((reason != nullptr) ? reason : "power_on"));
+    sql += escapeSqlText(std::string((reason != nullptr) ? reason : "power_on"));
     sql += "',";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ");";
 
     return executeNoResult(sql);
@@ -624,7 +632,7 @@ bool DatabaseStore::syncPeersFromManager(const EspNowManager& espNow) {
     return allOk;
 }
 
-bool DatabaseStore::getStatus(String& outText) {
+bool DatabaseStore::getStatus(std::string& outText) {
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
@@ -644,18 +652,18 @@ bool DatabaseStore::getStatus(String& outText) {
         line,
         sizeof(line),
         "[database] pronto arquivo=%s peers=%ld comandos=%ld tx=%ld boots=%ld",
-        kSqliteDatabasePath,
+        kDatabasePath,
         peersOk ? static_cast<long>(peerRows) : -1L,
         commandsOk ? static_cast<long>(commandRows) : -1L,
         outgoingOk ? static_cast<long>(outgoingRows) : -1L,
         bootsOk ? static_cast<long>(bootRows) : -1L
     );
 
-    outText = String(line);
+    outText = line;
     return true;
 }
 
-bool DatabaseStore::listTables(String& outText) {
+bool DatabaseStore::listTables(std::string& outText) {
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
@@ -668,7 +676,7 @@ bool DatabaseStore::listTables(String& outText) {
     );
 }
 
-bool DatabaseStore::readTable(const String& tableName, size_t limit, String& outText) {
+bool DatabaseStore::readTable(const std::string& tableName, size_t limit, std::string& outText) {
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
@@ -686,16 +694,16 @@ bool DatabaseStore::readTable(const String& tableName, size_t limit, String& out
         limit = 200;
     }
 
-    String sql = "SELECT * FROM ";
+    std::string sql = "SELECT * FROM ";
     sql += tableName;
     sql += " LIMIT ";
-    sql += static_cast<unsigned long>(limit);
+    sql += std::to_string(static_cast<unsigned long>(limit));
     sql += ";";
 
     return queryToText(sql, limit, outText);
 }
 
-bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
+bool DatabaseStore::readCommandLogsWithOutput(size_t limit, std::string& outText) {
         if (!lockDb()) {
             outText = "[database] lock indisponivel";
             return false;
@@ -713,19 +721,19 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
         limit = 200;
     }
 
-    String sql;
+    std::string sql;
     sql.reserve(220);
     sql += "SELECT c.id, c.created_at, c.source, c.command, o.output ";
     sql += "FROM command_log c ";
     sql += "LEFT JOIN command_log_output o ON o.log_id = c.id ";
     sql += "ORDER BY c.id DESC LIMIT ";
-    sql += static_cast<unsigned long>(limit);
+    sql += std::to_string(static_cast<unsigned long>(limit));
     sql += ";";
 
     sqlite3_stmt* stmt = nullptr;
     const int prepareRc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (prepareRc != SQLITE_OK || stmt == nullptr) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
@@ -738,14 +746,14 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
 
         const int32_t id = static_cast<int32_t>(sqlite3_column_int(stmt, 0));
         const int64_t createdAt = static_cast<int64_t>(sqlite3_column_int64(stmt, 1));
-        const String source = sanitizeAndTruncateField(safeColumnText(stmt, 2), 24);
-        const String command = sanitizeAndTruncateField(safeColumnText(stmt, 3), 72);
-        const String output = sanitizeAndTruncateField(safeColumnText(stmt, 4), 96);
+        const std::string source = sanitizeAndTruncateField(safeColumnText(stmt, 2), 24);
+        const std::string command = sanitizeAndTruncateField(safeColumnText(stmt, 3), 72);
+        const std::string output = sanitizeAndTruncateField(safeColumnText(stmt, 4), 96);
 
         outText += "[";
-        outText += static_cast<unsigned long>(rowCount);
+        outText += std::to_string(static_cast<unsigned long>(rowCount));
         outText += "] id=";
-        outText += static_cast<long>(id);
+        outText += std::to_string(static_cast<long>(id));
         outText += " | data_hora=";
         outText += epochToDateTimeText(createdAt);
         outText += " | source=";
@@ -760,7 +768,7 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
     sqlite3_finalize(stmt);
 
     if (stepRc != SQLITE_DONE) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
@@ -774,7 +782,7 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
     return true;
 }
 
-bool DatabaseStore::readRecentCommands(size_t limit, String& outText) {
+bool DatabaseStore::readRecentCommands(size_t limit, std::string& outText) {
     if (!lockDb()) {
         outText = "[database] lock indisponivel";
         return false;
@@ -793,18 +801,18 @@ bool DatabaseStore::readRecentCommands(size_t limit, String& outText) {
         limit = 256;
     }
 
-    String sql;
+    std::string sql;
     sql.reserve(280);
     sql += "SELECT command FROM (";
     sql += "SELECT id, command FROM command_log ";
     sql += "WHERE source='serial' ORDER BY id DESC LIMIT ";
-    sql += static_cast<unsigned long>(limit);
+    sql += std::to_string(static_cast<unsigned long>(limit));
     sql += ") t ORDER BY id ASC;";
 
     sqlite3_stmt* stmt = nullptr;
     const int prepareRc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (prepareRc != SQLITE_OK || stmt == nullptr) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
@@ -824,17 +832,17 @@ bool DatabaseStore::readRecentCommands(size_t limit, String& outText) {
     sqlite3_finalize(stmt);
 
     if (stepRc != SQLITE_DONE) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
 
-    outText.trim();
+    strcompat::trim(outText);
     unlockDb();
     return true;
 }
 
-bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
+bool DatabaseStore::readEspNowHistory(size_t limit, std::string& outText) {
         if (!lockDb()) {
             outText = "[database] lock indisponivel";
             return false;
@@ -852,19 +860,19 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
         limit = 200;
     }
 
-    String txSql;
+    std::string txSql;
     txSql.reserve(240);
     txSql += "SELECT o.id, o.sent_at, p.name, o.mac, o.payload, o.delivered ";
     txSql += "FROM espnow_outgoing_log o ";
     txSql += "LEFT JOIN peers p ON p.id = o.peer_id ";
     txSql += "ORDER BY o.sent_at DESC LIMIT ";
-    txSql += static_cast<unsigned long>(limit);
+    txSql += std::to_string(static_cast<unsigned long>(limit));
     txSql += ";";
 
     sqlite3_stmt* txStmt = nullptr;
     int prepareRc = sqlite3_prepare_v2(db_, txSql.c_str(), -1, &txStmt, nullptr);
     if (prepareRc != SQLITE_OK || txStmt == nullptr) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
@@ -877,15 +885,15 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
 
         const int32_t id = static_cast<int32_t>(sqlite3_column_int(txStmt, 0));
         const int64_t sentAt = static_cast<int64_t>(sqlite3_column_int64(txStmt, 1));
-        const String peer = sanitizeAndTruncateField(safeColumnText(txStmt, 2), 24);
-        const String mac = sanitizeAndTruncateField(safeColumnText(txStmt, 3), 17);
-        const String message = sanitizeAndTruncateField(safeColumnText(txStmt, 4), 96);
+        const std::string peer = sanitizeAndTruncateField(safeColumnText(txStmt, 2), 24);
+        const std::string mac = sanitizeAndTruncateField(safeColumnText(txStmt, 3), 17);
+        const std::string message = sanitizeAndTruncateField(safeColumnText(txStmt, 4), 96);
         const bool delivered = sqlite3_column_int(txStmt, 5) == 1;
 
         outText += "[";
-        outText += static_cast<unsigned long>(txRows);
+        outText += std::to_string(static_cast<unsigned long>(txRows));
         outText += "] id=";
-        outText += static_cast<long>(id);
+        outText += std::to_string(static_cast<long>(id));
         outText += " | data_hora=";
         outText += epochToDateTimeText(sentAt);
         outText += " | peer=";
@@ -902,7 +910,7 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     sqlite3_finalize(txStmt);
 
     if (txStepRc != SQLITE_DONE) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
@@ -916,7 +924,7 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     return true;
 }
 
-bool DatabaseStore::dropTable(const String& tableName) {
+bool DatabaseStore::dropTable(const std::string& tableName) {
     if (!ready_) {
         return false;
     }
@@ -925,22 +933,22 @@ bool DatabaseStore::dropTable(const String& tableName) {
         return false;
     }
 
-    String sql = "DROP TABLE IF EXISTS ";
+    std::string sql = "DROP TABLE IF EXISTS ";
     sql += tableName;
     sql += ";";
 
     return executeNoResult(sql);
 }
 
-bool DatabaseStore::executeSql(const String& sql, String& outText) {
+bool DatabaseStore::executeSql(const std::string& sql, std::string& outText) {
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
     }
 
-    String trimmed = sql;
-    trimmed.trim();
-    if (trimmed.isEmpty()) {
+    std::string trimmed = sql;
+    strcompat::trim(trimmed);
+    if (trimmed.empty()) {
         outText = "[database] SQL vazio";
         return false;
     }
@@ -948,7 +956,7 @@ bool DatabaseStore::executeSql(const String& sql, String& outText) {
     return queryToText(trimmed, 80, outText);
 }
 
-bool DatabaseStore::countRows(const String& tableName, int32_t& outCount) {
+bool DatabaseStore::countRows(const std::string& tableName, int32_t& outCount) {
     if (!ready_) {
         return false;
     }
@@ -957,25 +965,25 @@ bool DatabaseStore::countRows(const String& tableName, int32_t& outCount) {
         return false;
     }
 
-    String sql = "SELECT COUNT(*) FROM ";
+    std::string sql = "SELECT COUNT(*) FROM ";
     sql += tableName;
     sql += ";";
 
     return querySingleInt(sql, outCount);
 }
 
-bool DatabaseStore::deleteRows(const String& tableName, const String& whereClause, int32_t& outDeletedCount) {
+bool DatabaseStore::deleteRows(const std::string& tableName, const std::string& whereClause, int32_t& outDeletedCount) {
     outDeletedCount = 0;
 
     if (!ready_ || db_ == nullptr) {
         return false;
     }
 
-    if (!isSafeIdentifier(tableName) || whereClause.isEmpty()) {
+    if (!isSafeIdentifier(tableName) || whereClause.empty()) {
         return false;
     }
 
-    String sql = "DELETE FROM ";
+    std::string sql = "DELETE FROM ";
     sql += tableName;
     sql += " WHERE ";
     sql += whereClause;
@@ -989,7 +997,7 @@ bool DatabaseStore::deleteRows(const String& tableName, const String& whereClaus
     const int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errorMessage);
     if (rc != SQLITE_OK) {
         if (errorMessage != nullptr) {
-            logLine(String("[database] SQL error: ") + errorMessage);
+            logLine(std::string("[database] SQL error: ") + errorMessage);
             sqlite3_free(errorMessage);
         }
         unlockDb();
@@ -1001,17 +1009,16 @@ bool DatabaseStore::deleteRows(const String& tableName, const String& whereClaus
     return true;
 }
 
-bool DatabaseStore::vacuum(String& outText) {
+bool DatabaseStore::vacuum(std::string& outText) {
     if (!ready_ || db_ == nullptr) {
         outText = "[database] nao inicializado";
         return false;
     }
 
     uint64_t beforeBytes = 0;
-    File beforeFile = SD_MMC.open(kFsDatabasePath, FILE_READ);
-    if (beforeFile) {
-        beforeBytes = static_cast<uint64_t>(beforeFile.size());
-        beforeFile.close();
+    struct stat beforeStat;
+    if (::stat(kDatabasePath, &beforeStat) == 0) {
+        beforeBytes = static_cast<uint64_t>(beforeStat.st_size);
     }
 
     if (!executeNoResult("VACUUM;")) {
@@ -1020,10 +1027,9 @@ bool DatabaseStore::vacuum(String& outText) {
     }
 
     uint64_t afterBytes = 0;
-    File afterFile = SD_MMC.open(kFsDatabasePath, FILE_READ);
-    if (afterFile) {
-        afterBytes = static_cast<uint64_t>(afterFile.size());
-        afterFile.close();
+    struct stat afterStat;
+    if (::stat(kDatabasePath, &afterStat) == 0) {
+        afterBytes = static_cast<uint64_t>(afterStat.st_size);
     }
 
     char line[128] = {0};
@@ -1038,7 +1044,7 @@ bool DatabaseStore::vacuum(String& outText) {
     return true;
 }
 
-bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
+bool DatabaseStore::exportTableToCsv(const std::string& tableName, std::string& outText) {
     if (!ready_ || db_ == nullptr) {
         outText = "[database] nao inicializado";
         return false;
@@ -1054,33 +1060,30 @@ bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
         return false;
     }
 
-    String selectSql = "SELECT * FROM ";
+    std::string selectSql = "SELECT * FROM ";
     selectSql += tableName;
     selectSql += ";";
 
     sqlite3_stmt* stmt = nullptr;
     const int prepareRc = sqlite3_prepare_v2(db_, selectSql.c_str(), -1, &stmt, nullptr);
     if (prepareRc != SQLITE_OK || stmt == nullptr) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error: ") + sqlite3_errmsg(db_);
         unlockDb();
         return false;
     }
 
-    File exportDir = SD_MMC.open("/database/exports");
-    const bool hasExportDir = exportDir && exportDir.isDirectory();
-    if (exportDir) {
-        exportDir.close();
-    }
-    if (!hasExportDir && !SD_MMC.mkdir("/database/exports")) {
+    static constexpr const char* kExportDir = "/sdcard/database/exports";
+
+    if (!sdPathIsDirectory(kExportDir) && ::mkdir(kExportDir, 0775) != 0) {
         sqlite3_finalize(stmt);
         unlockDb();
         outText = "[database] falha ao criar pasta de exportacao";
         return false;
     }
 
-    const String csvPath = String("/database/exports/") + tableName + ".csv";
-    File csvFile = SD_MMC.open(csvPath, FILE_WRITE);
-    if (!csvFile) {
+    const std::string csvPath = std::string(kExportDir) + "/" + tableName + ".csv";
+    std::FILE* csvFile = std::fopen(csvPath.c_str(), "wb");
+    if (csvFile == nullptr) {
         sqlite3_finalize(stmt);
         unlockDb();
         outText = "[database] falha ao criar arquivo CSV";
@@ -1090,18 +1093,18 @@ bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
     const int columnCount = sqlite3_column_count(stmt);
     for (int i = 0; i < columnCount; ++i) {
         if (i > 0) {
-            csvFile.print(",");
+            std::fputs(",", csvFile);
         }
-        csvFile.print(sqlite3_column_name(stmt, i));
+        std::fputs(sqlite3_column_name(stmt, i), csvFile);
     }
-    csvFile.print("\n");
+    std::fputs("\n", csvFile);
 
     size_t rowCount = 0;
     int stepRc = SQLITE_ROW;
     while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
         for (int i = 0; i < columnCount; ++i) {
             if (i > 0) {
-                csvFile.print(",");
+                std::fputs(",", csvFile);
             }
 
             const unsigned char* text = sqlite3_column_text(stmt, i);
@@ -1109,30 +1112,30 @@ bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
                 continue;
             }
 
-            String value = reinterpret_cast<const char*>(text);
-            value.replace("\"", "\"\"");
-            if (value.indexOf(',') >= 0 || value.indexOf('"') >= 0 || value.indexOf('\n') >= 0) {
-                csvFile.print("\"");
-                csvFile.print(value);
-                csvFile.print("\"");
+            std::string value = reinterpret_cast<const char*>(text);
+            strcompat::replaceAll(value, "\"", "\"\"");
+            if (strcompat::indexOf(value, ',') >= 0 || strcompat::indexOf(value, '"') >= 0 || strcompat::indexOf(value, '\n') >= 0) {
+                std::fputs("\"", csvFile);
+                std::fputs(value.c_str(), csvFile);
+                std::fputs("\"", csvFile);
             } else {
-                csvFile.print(value);
+                std::fputs(value.c_str(), csvFile);
             }
         }
-        csvFile.print("\n");
+        std::fputs("\n", csvFile);
         ++rowCount;
     }
 
-    csvFile.close();
+    std::fclose(csvFile);
     sqlite3_finalize(stmt);
     unlockDb();
 
     if (stepRc != SQLITE_DONE) {
-        outText = String("[database] SQL error durante exportacao: ") + sqlite3_errmsg(db_);
+        outText = std::string("[database] SQL error durante exportacao: ") + sqlite3_errmsg(db_);
         return false;
     }
 
-    char line[160] = {0};
+    char line[192] = {0};
     std::snprintf(
         line,
         sizeof(line),
@@ -1145,7 +1148,7 @@ bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
     return true;
 }
 
-bool DatabaseStore::clearLogs(String& outText) {
+bool DatabaseStore::clearLogs(std::string& outText) {
     if (!ready_ || db_ == nullptr) {
         outText = "[database] nao inicializado";
         return false;
@@ -1213,10 +1216,27 @@ bool DatabaseStore::openDatabase() {
         return true;
     }
 
-    const int rc = sqlite3_open(kSqliteDatabasePath, &db_);
+    // The vendored components/esp32-idf-sqlite3's config_ext.h sets
+    // SQLITE_OMIT_AUTOINIT=1 (an embedded-target code-size optimization),
+    // which compiles OUT sqlite3_open()'s normal implicit
+    // sqlite3_initialize() call. Found on the bench (ESP-IDF migration,
+    // PLANO_ESPIDF_DONGLE.md phase 5): without an explicit call here,
+    // sqlite3GlobalConfig.m (the malloc/free/realloc vtable) is never
+    // populated -- its xMalloc stays a null function pointer, and the very
+    // first internal sqlite3_malloc() call inside sqlite3_open() crashes
+    // with a Guru Meditation (InstrFetchProhibited) jumping to address 0.
+    // Idempotent/cheap on every call after the first (sqlite3_initialize()
+    // checks its own isInit flag and returns immediately).
+    if (sqlite3_initialize() != SQLITE_OK) {
+        logLine("[database] sqlite3_initialize() falhou");
+        unlockDb();
+        return false;
+    }
+
+    const int rc = sqlite3_open(kDatabasePath, &db_);
     if (rc != SQLITE_OK || db_ == nullptr) {
         if (db_ != nullptr) {
-            logLine(String("[database] sqlite open error: ") + sqlite3_errmsg(db_));
+            logLine(std::string("[database] sqlite open error: ") + sqlite3_errmsg(db_));
             sqlite3_close(db_);
             db_ = nullptr;
         } else {
@@ -1255,24 +1275,19 @@ void DatabaseStore::closeDatabase() {
 }
 
 bool DatabaseStore::ensureBootstrapAssets() {
-    File databaseDir = SD_MMC.open(kFsDatabaseDir);
-    const bool hasDirectory = databaseDir && databaseDir.isDirectory();
-    if (databaseDir) {
-        databaseDir.close();
-    }
-
-    if (!hasDirectory && !SD_MMC.mkdir(kFsDatabaseDir)) {
+    if (!sdPathIsDirectory(kDatabaseDir) && ::mkdir(kDatabaseDir, 0775) != 0) {
         return false;
     }
 
-    if (!SD_MMC.exists(kFsBootstrapPath)) {
-        File bootstrapFile = SD_MMC.open(kFsBootstrapPath, FILE_WRITE);
-        if (!bootstrapFile) {
+    if (!sdPathExists(kBootstrapPath)) {
+        std::FILE* bootstrapFile = std::fopen(kBootstrapPath, "w");
+        if (bootstrapFile == nullptr) {
             return false;
         }
 
-        const size_t bytesWritten = bootstrapFile.print(kDefaultBootstrapSql);
-        bootstrapFile.close();
+        const size_t textLen = std::strlen(kDefaultBootstrapSql);
+        const size_t bytesWritten = std::fwrite(kDefaultBootstrapSql, 1, textLen, bootstrapFile);
+        std::fclose(bootstrapFile);
 
         if (bytesWritten == 0) {
             return false;
@@ -1285,15 +1300,24 @@ bool DatabaseStore::ensureBootstrapAssets() {
 }
 
 bool DatabaseStore::applyBootstrapScript() {
-    File bootstrapFile = SD_MMC.open(kFsBootstrapPath, FILE_READ);
-    if (!bootstrapFile) {
+    std::FILE* bootstrapFile = std::fopen(kBootstrapPath, "r");
+    if (bootstrapFile == nullptr) {
         return false;
     }
 
-    const String script = bootstrapFile.readString();
-    bootstrapFile.close();
+    std::fseek(bootstrapFile, 0, SEEK_END);
+    const long fileSize = std::ftell(bootstrapFile);
+    std::rewind(bootstrapFile);
 
-    if (script.isEmpty()) {
+    std::string script;
+    if (fileSize > 0) {
+        script.resize(static_cast<size_t>(fileSize));
+        const size_t bytesRead = std::fread(&script[0], 1, static_cast<size_t>(fileSize), bootstrapFile);
+        script.resize(bytesRead);
+    }
+    std::fclose(bootstrapFile);
+
+    if (script.empty()) {
         return false;
     }
 
@@ -1338,24 +1362,24 @@ bool DatabaseStore::ensureDefaultBroadcastPeer() {
 
     const int64_t now = currentEpochSeconds();
 
-    String insertSql;
+    std::string insertSql;
     insertSql.reserve(280);
     insertSql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
     insertSql += "FF:FF:FF:FF:FF:FF";
     insertSql += "','Default','peer virtual padrao para broadcast',";
-    insertSql += String(static_cast<long long>(now));
+    insertSql += std::to_string(static_cast<long long>(now));
     insertSql += ",";
-    insertSql += String(static_cast<long long>(now));
+    insertSql += std::to_string(static_cast<long long>(now));
     insertSql += ");";
 
     if (!executeNoResult(insertSql)) {
         return false;
     }
 
-    String updateSql;
+    std::string updateSql;
     updateSql.reserve(240);
     updateSql += "UPDATE peers SET name='Default', description='peer virtual padrao para broadcast', updated_at=";
-    updateSql += String(static_cast<long long>(now));
+    updateSql += std::to_string(static_cast<long long>(now));
     updateSql += " WHERE mac='FF:FF:FF:FF:FF:FF';";
 
     return executeNoResult(updateSql);
@@ -1366,7 +1390,7 @@ bool DatabaseStore::peerIdByMac(const uint8_t mac[6], int32_t& outPeerId) {
         return false;
     }
 
-    String sql = "SELECT id FROM peers WHERE mac='";
+    std::string sql = "SELECT id FROM peers WHERE mac='";
     sql += escapeSqlText(macToText(mac));
     sql += "' LIMIT 1;";
 
@@ -1387,18 +1411,18 @@ bool DatabaseStore::ensurePeerExistsWithDefaults(const uint8_t mac[6], int32_t& 
     std::snprintf(defaultName, sizeof(defaultName), "peer-%02X%02X", mac[4], mac[5]);
 
     const int64_t now = currentEpochSeconds();
-    String sql;
+    std::string sql;
     sql.reserve(360);
     sql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
     sql += escapeSqlText(macToText(mac));
     sql += "','";
-    sql += escapeSqlText(String(defaultName));
+    sql += escapeSqlText(std::string(defaultName));
     sql += "','";
     sql += "adicionado automaticamente por RX ESP-NOW";
     sql += "',";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ",";
-    sql += String(static_cast<long long>(now));
+    sql += std::to_string(static_cast<long long>(now));
     sql += ");";
 
     if (!executeNoResult(sql)) {
@@ -1488,7 +1512,7 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
 
     if (rc != SQLITE_OK) {
         if (errorMessage != nullptr) {
-            logLine(String("[database] erro carregando peers: ") + errorMessage);
+            logLine(std::string("[database] erro carregando peers: ") + errorMessage);
             sqlite3_free(errorMessage);
         }
         unlockDb();
@@ -1511,7 +1535,7 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
     return true;
 }
 
-bool DatabaseStore::executeNoResult(const String& sql) {
+bool DatabaseStore::executeNoResult(const std::string& sql) {
     if (!lockDb()) {
         return false;
     }
@@ -1525,7 +1549,7 @@ bool DatabaseStore::executeNoResult(const String& sql) {
     const int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errorMessage);
     if (rc != SQLITE_OK) {
         if (errorMessage != nullptr) {
-            logLine(String("[database] SQL error: ") + errorMessage);
+            logLine(std::string("[database] SQL error: ") + errorMessage);
             sqlite3_free(errorMessage);
         }
         unlockDb();
@@ -1537,7 +1561,7 @@ bool DatabaseStore::executeNoResult(const String& sql) {
     return true;
 }
 
-bool DatabaseStore::querySingleInt(const String& sql, int32_t& outValue) {
+bool DatabaseStore::querySingleInt(const std::string& sql, int32_t& outValue) {
     if (!lockDb()) {
         return false;
     }
@@ -1569,7 +1593,7 @@ bool DatabaseStore::querySingleInt(const String& sql, int32_t& outValue) {
     return true;
 }
 
-bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outText) {
+bool DatabaseStore::queryToText(const std::string& sql, size_t maxRows, std::string& outText) {
     if (!lockDb()) {
         outText = "[database] lock indisponivel";
         return false;
@@ -1589,7 +1613,7 @@ bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outTe
 
     if (rc != SQLITE_OK && rc != SQLITE_ABORT) {
         if (errorMessage != nullptr) {
-            outText = String("[database] SQL error: ") + errorMessage;
+            outText = std::string("[database] SQL error: ") + errorMessage;
             sqlite3_free(errorMessage);
         } else {
             outText = "[database] SQL error";
@@ -1620,14 +1644,15 @@ int64_t DatabaseStore::currentEpochSeconds() {
     return static_cast<int64_t>(millis() / 1000ULL);
 }
 
-void DatabaseStore::logLine(const String& text) const {
+void DatabaseStore::logLine(const std::string& text) const {
     if (io_ != nullptr) {
-        io_->println(text);
+        io_->print(text.c_str());
+        io_->write(static_cast<uint8_t>('\n'));
     }
 }
 
-bool DatabaseStore::isSafeIdentifier(const String& value) {
-    if (value.isEmpty()) {
+bool DatabaseStore::isSafeIdentifier(const std::string& value) {
+    if (value.empty()) {
         return false;
     }
 
@@ -1638,15 +1663,15 @@ bool DatabaseStore::isSafeIdentifier(const String& value) {
         }
     }
 
-    if (value.startsWith("sqlite_")) {
+    if (strcompat::startsWith(value, "sqlite_")) {
         return false;
     }
 
     return true;
 }
 
-String DatabaseStore::escapeSqlText(const String& value) {
-    String escaped;
+std::string DatabaseStore::escapeSqlText(const std::string& value) {
+    std::string escaped;
     escaped.reserve(value.length() + 8);
 
     for (size_t i = 0; i < value.length(); ++i) {
@@ -1660,7 +1685,7 @@ String DatabaseStore::escapeSqlText(const String& value) {
     return escaped;
 }
 
-String DatabaseStore::macToText(const uint8_t mac[6]) {
+std::string DatabaseStore::macToText(const uint8_t mac[6]) {
     char macText[18] = {0};
     std::snprintf(
         macText,
@@ -1668,5 +1693,5 @@ String DatabaseStore::macToText(const uint8_t mac[6]) {
         "%02X:%02X:%02X:%02X:%02X:%02X",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    return String(macText);
+    return std::string(macText);
 }

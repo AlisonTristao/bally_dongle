@@ -1,7 +1,8 @@
 #pragma once
 
-#include <Arduino.h>
 #include <DonglePeripherals.h>
+
+#include "compat.h"
 
 namespace StartupConfig{
 
@@ -10,9 +11,12 @@ namespace StartupConfig{
  * serial terminal/monitor to attach -- see the definition for why that wait
  * was removed.
  *
+ * @param io Console transport for the "startup: iniciando..." banner line
+ * (phase 6: ConsoleCdc; there is no Arduino global Serial anymore).
+ *
  * No interactive prompt follows: the clock is queried/corrected by the BTP
  * client via the "dongle clock" / "dongle set_clock" shell commands.
  */
-void announceBoot(DonglePeripherals& peripherals);
+void announceBoot(DonglePeripherals& peripherals, ByteIO& io);
 
 } // namespace StartupConfig
