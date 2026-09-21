@@ -35,9 +35,10 @@ comandos existentes.
   platformio run -e tdongle-s3
   platformio test -e native
   ```
-  Zero erros e zero warnings novos (os warnings pré-existentes do `Sqlite3Esp32` upstream,
-  filtrados por `scripts/pio_warnings.py`, não contam). O segundo comando também roda
-  `check_user_text.py` (seção 1) e os testes host-native (ver README.md § 10).
+  Zero erros e zero warnings novos (os warnings pré-existentes do código vendorizado em
+  `components/esp32-idf-sqlite3`/`components/lovyangfx` upstream, silenciados via
+  `-Wno-error=*` nos `CMakeLists.txt` desses componentes, não contam). O segundo comando
+  também roda `check_user_text.py` (seção 1) e os testes host-native (ver README.md § 10).
 
 ## 2. Padrão de "módulo de comando"
 

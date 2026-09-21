@@ -15,13 +15,17 @@ para alterar/estender o firmware.
 
 ## 1. Stack
 
-- Framework Arduino via PlatformIO
-- ESP32-S3 (`esp32-s3-devkitc-1`), C++17
+- Framework ESP-IDF puro via PlatformIO (`framework = espidf`, sem Arduino — ver
+  `PLANO_ESPIDF_DONGLE.md` no histórico do git para o raciocínio da migração)
+- ESP32-S3 (`esp32-s3-devkitc-1`), C++20
 - [TinyShell](https://github.com/AlisonTristao/TinyShell) — dispatch de módulos/comandos
-- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v2.9.0`) — codec/fragmentação
-  do Binary Telemetry Protocol (fio v2, `version == 0x02`), compartilhado com `Bally_OS`/`TraceView`
-- SQLite (`Sqlite3Esp32`) sobre SD_MMC
-- Adafruit GFX + ST7735 (LCD 160x80)
+- [BTP](https://github.com/AlisonTristao/BTP) (`components/btp`, componente ESP-IDF — não
+  `lib_deps`, precisa do grafo CMake pra ver mbedtls/PSA) — codec/fragmentação do Binary
+  Telemetry Protocol (fio v2, `version == 0x02`), compartilhado com `Bally_OS`/`TraceView`
+- SQLite (`components/esp32-idf-sqlite3`, vendorizado) sobre `esp_vfs_fat_sdmmc_mount`
+- LovyanGFX (`components/lovyangfx`, vendorizado — `Panel_ST7735S`) + ST7735 (LCD 160x80)
+- esp_tinyusb: dispositivo USB composto (CDC-ACM + HID vendor), descritor montado na mão em
+  `lib/Compat/UsbComposite` (o gerador de descritor do próprio `esp_tinyusb` não cobre HID)
 
 ## 2. Hardware alvo: T-Dongle-S3
 
@@ -31,17 +35,22 @@ Todo o mapeamento de pinos fica centralizado em [include/config.h](include/confi
 | Periférico | Pinos |
 |---|---|
 | LED RGB onboard (DI/CI) | GPIO40 / GPIO39 |
-| LCD ST7735 (SPI bit-banged) | CS=4, SDA(MOSI)=3, SCL(SCLK)=5, DC=2, RST=1, BL=38 |
+| LCD ST7735 (SPI real, `SPI2_HOST`) | CS=4, SDA(MOSI)=3, SCL(SCLK)=5, DC=2, RST=1, BL=38 |
 | SD_MMC | D0=14, D1=17, D2=18, D3=21, CLK=12, CMD=16 |
 | Botão BOOT | GPIO0 |
-| USB nativo | D-=19, D+=20 |
+| USB nativo (composto CDC+HID via esp_tinyusb) | D-=19, D+=20 |
 
 Observações de hardware já tratadas no código:
-- calibração de offset do painel ST7735 (`TFT_COL_START=26`, `TFT_ROW_START=1`)
-- correção de cor (bit-invert + swap R/B) aplicada em `ShellCommandSupport::lcdColorForLine`
+- calibração de offset do painel ST7735 (`TFT_COL_START=26`, `TFT_ROW_START=1`, mesmos
+  valores que `Adafruit_ST7735::initR(INITR_MINI160x80)` usava — o painel é a variante "R"
+  do chip, por isso `DonglePeripherals`/`lib/Compat` usam `lgfx::Panel_ST7735S`, não
+  `Panel_ST7735` que apesar do nome é a sequência de init do chip B)
+- correção de cor (bit-invert + swap R/B) aplicada em `LcdDashboard::toPanelColor` e em
+  `ShellCommandSupport::lcdColorForLine`
 - polaridade de backlight configurável em runtime (`dongle -lcd_bl_inv`)
-- "PIN_TFT_SDA"/"PIN_TFT_SCL" são os nomes dos sinais MOSI/SCLK do SPI bit-banged do LCD —
-  **não há I2C real neste projeto** (sem `Wire.h`, sem periférico I2C em uso)
+- "PIN_TFT_SDA"/"PIN_TFT_SCL" são os nomes dos sinais MOSI/SCLK do SPI do LCD (driver real
+  via `esp_driver_spi`, não mais bit-banged desde a migração pra ESP-IDF/LovyanGFX) —
+  **não há I2C real neste projeto** (sem periférico I2C em uso)
 
 A senha usada pelo `sudo` do shell (ver seção 7) também mora em `config.h`
 (`BoardConfig::SUDO_PASSWORD`) — troque antes de gravar em um dongle real.
@@ -181,13 +190,26 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 
 ## 4. Fluxo de execução
 
+> **Migração ESP-IDF em andamento**: esta seção descreve o fluxo alvo, o mesmo que valia
+> quando o firmware era `framework = arduino`. `AppRuntime` ainda não foi portado pro
+> ESP-IDF (ainda depende de `WiFi.h`/`USB.h`/`Esp.h`/`Serial`) e por isso `src/main.cpp`
+> hoje **não** chama `AppRuntime::begin()/tick()` — é um scaffold de smoke test, fase por
+> fase (ver histórico do `PLANO_ESPIDF_DONGLE.md`), que já sobe `EspNowManager`,
+> `DongleKeyStore`, `DongleSdCard`+`DatabaseStore`, o USB composto (`UsbComposite`+
+> `ConsoleCdc`+`UsbHidMux`) e `DonglePeripherals`+`LcdDashboard`+`StartupConfig`
+> individualmente, mas ainda sem `ShellConfig`/`EspNowConfig`/os módulos de comando
+> conectados entre si. Portar `AppRuntime` de volta é o que falta pra esta seção passar a
+> descrever o `main.cpp` real de novo.
+
 `src/main.cpp` só chama `AppRuntime::begin()` (setup) e `AppRuntime::tick()` (loop).
 
 ### `AppRuntime::begin()`
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
-2. `Serial.setRxBufferSize(1024)` (margem para as linhas `BTP/1 ENTER` que o
-   host empilha durante o boot, o default da CDC é 256 B) e `Serial.begin()`
+2. `UsbComposite::install()` + `ConsoleCdc::begin()` (era `Serial.setRxBufferSize(1024)` +
+   `Serial.begin()` sob Arduino; o buffer RX de 1KB agora é
+   `CONFIG_TINYUSB_CDC_RX_BUFSIZE` em `sdkconfig.defaults`, mesma margem pras linhas
+   `BTP/1 ENTER` que o host empilha durante o boot)
    na baudrate de `platformio.ini` (`BAUDRATE`, cosmético na CDC nativa)
 3. inicializa LED/LCD e anuncia o boot (`StartupConfig::announceBoot`) — não aguarda mais um
    monitor serial conectar (esse gate dependia de `Serial` refletir DTR asserted pelo host, o
@@ -623,20 +645,33 @@ a de menor prioridade) atrás de tráfego de telemetria.
 - `ShellCommandSupport::printLine()` manda a mesma linha para: serial, buffer de
   persistência (`command_log_output`) e banner do LCD (com cor por heurística de texto)
 
-> **A CDC nativa do ESP32-S3 (`ARDUINO_USB_MODE=0`) só TRANSMITE com DTR
-> afirmado pelo host.** `tud_cdc_n_connected()` testa só o bit DTR, e
-> `USBCDC::write()` retorna 0 — descartando todo byte — enquanto ele estiver
-> baixo. RX funciona sem DTR. Um terminal que abre a porta sem afirmar DTR vê
-> o serial **vazio** mesmo com o dongle rodando normal. `pio device monitor`,
-> PuTTY e o Serial Monitor do Arduino afirmam; alguns apps web e minicom sem
-> `-a` não. Qualquer cliente novo (script, ferramenta) tem que afirmar DTR —
-> é por isso que o TraceView faz `setDataTerminalReady(true)` ao abrir
-> (`SerialManager::open`). Ver tópico 35 F1.
+> **Pós-migração ESP-IDF (ainda não validado em hardware, ver `lib/Compat/ConsoleCdc.cpp`):**
+> a CDC composta via `esp_tinyusb` expõe DTR pelo evento `CDC_EVENT_LINE_STATE_CHANGED`
+> (`ConsoleCdc::setDtr`, usado pelo `ByteIO::operator bool()`), mas `ConsoleCdc::write()`
+> **não checa DTR antes de escrever** — sempre enfileira via
+> `tinyusb_cdcacm_write_queue`/`write_flush` (flush não-bloqueante), diferente do
+> `USBCDC::write()` do arduino-esp32 (que retornava 0 e descartava o byte com DTR baixo).
+> O comportamento real quando nenhum host está com a porta aberta (fila TX cheia por
+> `CONFIG_TINYUSB_CDC_TX_BUFSIZE` nunca esvaziar) ainda não foi observado em bancada — a
+> nota abaixo, sobre a CDC nativa do arduino-esp32 (`ARDUINO_USB_MODE=0`), descreve o
+> comportamento de **antes** da migração, preservada aqui como contexto histórico:
+>
+> A CDC nativa do ESP32-S3 sob Arduino (`ARDUINO_USB_MODE=0`) só TRANSMITIA com DTR
+> afirmado pelo host. `tud_cdc_n_connected()` testava só o bit DTR, e `USBCDC::write()`
+> retornava 0 — descartando todo byte — enquanto ele estivesse baixo. RX funcionava sem
+> DTR. Um terminal que abria a porta sem afirmar DTR via o serial **vazio** mesmo com o
+> dongle rodando normal. `pio device monitor`, PuTTY e o Serial Monitor do Arduino
+> afirmavam; alguns apps web e minicom sem `-a` não. É por isso que o TraceView faz
+> `setDataTerminalReady(true)` ao abrir (`SerialManager::open`) — continua fazendo sentido
+> manter isso do lado do cliente mesmo que o comportamento do lado do dongle tenha mudado.
 
 ## 10. Build, upload e monitor
 
-Config principal: [platformio.ini](platformio.ini) — ambiente `tdongle-s3`,
-`COM5 @ 921600`, C++17, USB CDC habilitado no boot.
+Config principal: [platformio.ini](platformio.ini) — ambiente `tdongle-s3`, `framework =
+espidf`, C++20 (`-std=gnu++2a`), `COM5 @ 115200`. `monitor_speed` é cosmético (decisão D4,
+revisada): os logs de sistema (`ESP_LOG`, panic handler) saem por `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`
+na mesma porta COM do flash, um controlador USB nativo diferente do CDC-ACM composto
+(`esp_tinyusb`) que carrega shell+BTP.
 
 ```bash
 platformio run -e tdongle-s3
@@ -644,17 +679,18 @@ platformio run -e tdongle-s3 -t upload
 platformio run -e tdongle-s3 -t monitor
 ```
 
-`scripts/pio_warnings.py` aplica `-Wno-discarded-qualifiers` na compilação C do
-`Sqlite3Esp32` (upstream gera esse warning, não é nosso código).
-
 `-DDIAG_BOOT` (em `build_flags`, **ligado por padrão** enquanto se valida o
 boot na bancada): imprime `after_* free_heap=` a cada alocador do `begin()`,
 `reg:* largest=` a cada módulo do shell, e segura 2 s no início para a CDC
 re-enumerar. Comente essa linha para um build de campo — o boot fica quieto
 (só `last_reset=`, que fica sempre ligado) e o handshake não paga os 2 s.
-`-DDONGLE_USB_NO_AUTORESET` desliga o reboot-por-linha da USBCDC (nenhum toque
-de 1200 bps nem sequência de DTR reinicia o firmware rodando) ao custo de
-gravar só com o botão BOOT — só para build de campo/demo.
+`-DDONGLE_USB_AUTORESET` (opt-IN, ao contrário do antigo `-DDONGLE_USB_NO_AUTORESET`
+opt-OUT do arduino-esp32) liga o reboot-por-linha de `ConsoleCdc` (toque de 1200 bps ->
+`chip_usb_set_persist_flags(USBDC_BOOT_DFU)` + `esp_restart()`, o mesmo truque que
+`esptool.py`/o antigo `USBCDC` usam): **ligado por padrão** enquanto se reflasheia com
+frequência na bancada; comente essa linha para um build de campo, onde a única forma de
+regravar deve ser segurar o botão BOOT — um host mal comportado não deve conseguir jogar o
+firmware rodando pro bootloader.
 
 Há também um ambiente host-only, `env:native`, que roda `ProtocolRouter`/`BtpTransport`/
 `SerialSession` contra os vetores canônicos de `BTP/test-vectors/v1` sem
@@ -677,11 +713,14 @@ traduzida pro português por engano — ver CONTRIBUTING.md § 1.
 
 ```text
 include/
-  config.h              # pinos + BoardConfig::SUDO_PASSWORD
+  config.h              # pinos + BoardConfig::SUDO_PASSWORD (driver/gpio.h, ESP-IDF)
   error_codes.h         # AppError::Code (um range por subsistema)
   bally_channels.h      # tabela unica de canal/chave (topico 25/30), copia byte-identica em 3 repos
+  compat.h              # ByteIO, millis()/delay() portáveis (ESP-IDF real vs. env:native)
+  string_compat.h       # subconjunto da API de Arduino String sobre std::string
 lib/
-  AppRuntime/            # dono dos objetos runtime, setup/loop, tasks FreeRTOS
+  AppRuntime/            # dono dos objetos runtime, setup/loop, tasks FreeRTOS -- AINDA NÃO
+                         # portado pro ESP-IDF (WiFi.h/USB.h/Esp.h/Serial), ver seção 4
   ShellConfig/           # bind + registro de módulos + runLine()
   ShellCommandSupport/   # Context compartilhado + helpers de wrapper
   ShellAliases/          # tabela de atalhos de comando
@@ -689,7 +728,8 @@ lib/
   EspNowManager/          # registry de peers + envio/recepção de bytes crus (sem BTP)
   BtpTransport/           # identidade BTP, sequência, envio fragmentado+selado, COMMAND envelope
   DongleKeyStore/         # deriva/guarda a chave L (PBKDF2, puro C++, testável em env:native)
-  RadioSeal/              # unico ponto que chama btp::aead -- seal/open do canal C (so Arduino)
+  RadioSeal/              # unico ponto que chama btp::aead -- seal/open do canal C (só no
+                          # firmware real, precisa do backend mbedtls/PSA que env:native não tem)
   ProtocolRouter/         # decode BTP + CRC + reassembly compartilhado (puro C++)
   HubRegistry/            # tabela de vinculo filho-do-console -> robo (tópico 28)
   HubRelay/               # classifica ingresso do rádio e reenquadra sem reoriginar (tópico 28)
@@ -697,19 +737,34 @@ lib/
   EspNowConfig/           # callbacks ESP-NOW, filas priorizadas por tipo, heartbeat, exec remota
   SerialSession/          # estado console/handshake BTP v1 da sessão serial (puro C++)
   SerialMux/              # unico escritor da serial no modo protocolado: COBS + filas FreeRTOS
-  UsbHidMux/              # segundo interface USB (HID), spike de eco (tópico 20, sem BTP real)
+  Compat/                 # UsbComposite (descritor USB CDC+HID) + ConsoleCdc (ByteIO real
+                          # sobre tinyusb_cdc_acm)
+  UsbHidMux/              # segunda interface USB (HID), eco sobre tud_hid_* (tópico 20, sem BTP real)
   ManifestCache/          # cache/agregação de MANIFEST_DATA por source_id (puro C++)
   SubscriptionRegistry/   # agregação de assinaturas e contadores por tópico (puro C++)
-  DatabaseStore/                 # schema SQLite e leituras/gravações
-  DonglePeripherals/ LcdDashboard/  # LED/LCD/SD e dashboard em grade
+  DongleSdCard/           # mount/unmount do cartão via esp_vfs_fat_sdmmc_mount
+  DatabaseStore/                 # schema SQLite e leituras/gravações (sobre DongleSdCard::kMountPoint)
+  DonglePeripherals/ LcdDashboard/  # LED/LCD (LovyanGFX) e dashboard em grade -- SD não é
+                                    # mais daqui, ver DongleSdCard acima
   SudoManager/                   # elevação de permissão por identidade
   ShellOutput/                   # formatação de saída do terminal
   StartupConfig/                 # sequência de boot
   (o editor de linha é ShellLineEditor, no pacote TinyShell)
+components/
+  btp/                   # BTP como componente ESP-IDF (REQUIRES mbedtls), fonte no
+                          # checkout irmão ../BTP -- não é lib_deps, precisa do grafo CMake
+  esp32-idf-sqlite3/     # SQLite vendorizado (siara-cc/esp32-idf-sqlite3), decisão D2
+  lovyangfx/              # LovyanGFX vendorizado (decisão D1) -- ver o CMakeLists.txt de lá
+                          # pro porquê de ser componente e não lib_deps, e o que foi cortado
+                          # do upstream antes de vendorizar
 src/
-  main.cpp
+  main.cpp               # hoje um scaffold de smoke test fase-por-fase, não AppRuntime (seção 4)
+  CMakeLists.txt
+  idf_component.yml      # dependência espressif/esp_tinyusb
 scripts/
-  pio_warnings.py
+  check_channel_contract.py  # valida bally_channels.h contra os outros 2 repos (pre-build)
+  check_espnow_tx_owner.py   # pre-build
+  inject_git_rev.py          # injeta -DDONGLE_GIT_REV (pre-build)
   native_static.py      # so para env:native (evita runtime MinGW solto no PATH)
   check_user_text.py    # so para env:native (audita convencao pt-br/ingles, ver CONTRIBUTING.md #1)
 test/
@@ -720,6 +775,9 @@ test/
   test_dongle_publisher/ # serialização hub.link/hub.usb/hub.peers + manifesto, roda em env:native
   test_hub_relay/        # ingresso/relay verbatim + vínculo (tópico 28), roda em env:native
   test_dongle_key_store/ # PBKDF2 vs. vetor de provision_key.py (tópico 29/30), roda em env:native
+  test_shell_output/     # ShellOutput pós-porte String->std::string, roda em env:native
+sdkconfig.defaults        # FreeRTOS/CPU, TinyUSB CDC+HID, console USB-Serial/JTAG
+partitions.csv             # layout `factory` único (sem OTA, decisão D3)
 platformio.ini
 CONTRIBUTING.md
 ```
@@ -769,9 +827,13 @@ CONTRIBUTING.md
 - banco em arquivo local no SD (sujeito a falhas de cartão/contato)
 - senha do `sudo` é uma constante compilada — trocar exige reflash; qualquer peer
   cadastrado que souber a senha tem controle total do dongle (ver seção 7.5)
-- bug intermitente conhecido, não resolvido: o LCD ocasionalmente "apaga" a tela por um
-  instante enquanto a serial continua atualizando normalmente; suspeita não confirmada é
-  contenção entre o SPI bit-banged do LCD e a task de rádio WiFi/ESP-NOW
+- bug intermitente conhecido, não resolvido (status pré-migração ESP-IDF, ainda não
+  reobservado): o LCD ocasionalmente "apaga" a tela por um instante enquanto a serial
+  continua atualizando normalmente; suspeita não confirmada era contenção entre o SPI
+  *bit-banged* do LCD e a task de rádio WiFi/ESP-NOW. A migração pra LovyanGFX trocou o LCD
+  pra SPI real via `esp_driver_spi` (`SPI2_HOST`), o que muda a natureza dessa contenção
+  (dois periféricos de hardware distintos, sem GPIO toggling manual competindo por CPU) —
+  vale reobservar em bancada se o sintoma ainda ocorre antes de reabrir essa hipótese
 
 ## 13. Dicas rápidas de uso
 
