@@ -1,5 +1,6 @@
 #include "DongleCommands.h"
 
+#include "DongleSdCard.h"
 #include "HubRegistry.h"
 #include "ManifestCache.h"
 #include "SerialMux.h"
@@ -8,15 +9,18 @@
 #include "DongleKeyStore.h"
 #include "error_codes.h"
 
-#include <Esp.h>
-#include <WiFi.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_mac.h>
+#include <esp_system.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/stat.h>
 #include <sys/time.h>
-#include <SD_MMC.h>
+#include <dirent.h>
 
 namespace {
 
@@ -28,9 +32,13 @@ using ShellCommandSupport::failWithCode;
 using ShellCommandSupport::parseDateTimeText;
 using ShellCommandSupport::printLine;
 using ShellCommandSupport::stripOuterQuotes;
+using ShellCommandSupport::trimCopy;
 using ShellCommandSupport::warnWithCode;
 
-// Normalizes a user-supplied path into an absolute SD path (leading '/').
+// Normalizes a user-supplied path into an absolute SD path (leading '/'),
+// relative to DongleSdCard::kMountPoint -- never printed with the mount
+// point prefix, same user-facing paths the old Arduino SD_MMC ("/" as its
+// own root) showed.
 string normalizeSdPath(const string& rawPath) {
     string cleanPath = stripOuterQuotes(rawPath);
     if (cleanPath.empty()) {
@@ -39,6 +47,24 @@ string normalizeSdPath(const string& rawPath) {
         cleanPath = "/" + cleanPath;
     }
     return cleanPath;
+}
+
+// Resolves a normalizeSdPath() result to the real VFS path underneath.
+string toFsPath(const string& cleanPath) {
+    if (cleanPath == "/") {
+        return string(DongleSdCard::kMountPoint);
+    }
+    return string(DongleSdCard::kMountPoint) + cleanPath;
+}
+
+const char* chipModelName(esp_chip_model_t model) {
+    switch (model) {
+        case CHIP_ESP32:   return "ESP32";
+        case CHIP_ESP32S2: return "ESP32-S2";
+        case CHIP_ESP32S3: return "ESP32-S3";
+        case CHIP_ESP32C3: return "ESP32-C3";
+        default:           return "ESP32(?)";
+    }
 }
 
 uint8_t wrapper_dongle_run(string command) {
@@ -142,10 +168,11 @@ uint8_t wrapper_dongle_lcd(string text) {
         return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd");
     }
 
-    const String content = String(stripOuterQuotes(text).c_str());
+    const string content = stripOuterQuotes(text);
 
     if (context().lcdDashboard != nullptr && context().lcdDashboard->isReady()) {
-        context().lcdDashboard->showMessage(content, ST77XX_BLACK);
+        constexpr uint16_t kRawBlack = 0x0000; // ST77XX_BLACK, pre-LovyanGFX
+        context().lcdDashboard->showMessage(content, kRawBlack);
         printLine("[dongle] texto escrito no painel LCD");
         return RESULT_OK;
     }
@@ -257,11 +284,7 @@ uint8_t wrapper_dongle_lcd_bl_inv(int32_t activeHigh) {
 }
 
 uint8_t wrapper_dongle_sd_init() {
-    if (context().peripherals == nullptr) {
-        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_init");
-    }
-
-    const bool ok = context().peripherals->beginSd(false);
+    const bool ok = DongleSdCard::begin(false);
     if (!ok) {
         return failWithCode(AppError::Code::SD_INIT_FAILED, "falha ao iniciar SD (verifique cartao, contato e pull-ups)");
     }
@@ -271,28 +294,24 @@ uint8_t wrapper_dongle_sd_init() {
         line,
         sizeof(line),
         "[dongle] SD inicializado (%u-bit @ %lukHz)",
-        context().peripherals->sdOneBitMode() ? 1U : 4U,
-        static_cast<unsigned long>(context().peripherals->sdFrequencyKHz())
+        DongleSdCard::oneBitMode() ? 1U : 4U,
+        static_cast<unsigned long>(DongleSdCard::frequencyKHz())
     );
     printLine(line);
     return RESULT_OK;
 }
 
 uint8_t wrapper_dongle_sd_status() {
-    if (context().peripherals == nullptr) {
-        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_status");
-    }
-
-    if (!context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         printLine("[dongle] SD nao inicializado");
         return RESULT_OK;
     }
 
-    const String type = context().peripherals->sdCardTypeName();
-    const uint64_t totalBytes = context().peripherals->sdTotalBytes();
-    const uint64_t usedBytes = context().peripherals->sdUsedBytes();
-    const uint64_t totalMB = context().peripherals->sdTotalMB();
-    const uint64_t usedMB = context().peripherals->sdUsedMB();
+    const string type = DongleSdCard::cardTypeName();
+    const uint64_t totalBytes = DongleSdCard::totalBytes();
+    const uint64_t usedBytes = DongleSdCard::usedBytes();
+    const uint64_t totalMB = DongleSdCard::totalMB();
+    const uint64_t usedMB = DongleSdCard::usedMB();
 
     uint64_t percentInt = 0;
     uint64_t percentFrac = 0;
@@ -302,15 +321,9 @@ uint8_t wrapper_dongle_sd_status() {
         percentFrac = percent100 % 100ULL;
     }
 
-    const bool dbExists = SD_MMC.exists("/database/dongle.db");
-    uint64_t dbBytes = 0;
-    if (dbExists) {
-        File dbFile = SD_MMC.open("/database/dongle.db", FILE_READ);
-        if (dbFile) {
-            dbBytes = static_cast<uint64_t>(dbFile.size());
-            dbFile.close();
-        }
-    }
+    struct stat dbStat {};
+    const bool dbExists = ::stat((string(DongleSdCard::kMountPoint) + "/database/dongle.db").c_str(), &dbStat) == 0;
+    const uint64_t dbBytes = dbExists ? static_cast<uint64_t>(dbStat.st_size) : 0ULL;
 
     char line[280] = {0};
     std::snprintf(
@@ -318,8 +331,8 @@ uint8_t wrapper_dongle_sd_status() {
         sizeof(line),
         "[dongle] SD %s %u-bit@%lukHz total=%lluMB(%lluB) usado=%lluMB(%lluB) uso=%llu.%02llu%% db=%s(%lluB)",
         type.c_str(),
-        context().peripherals->sdOneBitMode() ? 1U : 4U,
-        static_cast<unsigned long>(context().peripherals->sdFrequencyKHz()),
+        DongleSdCard::oneBitMode() ? 1U : 4U,
+        static_cast<unsigned long>(DongleSdCard::frequencyKHz()),
         static_cast<unsigned long long>(totalMB),
         static_cast<unsigned long long>(totalBytes),
         static_cast<unsigned long long>(usedMB),
@@ -338,15 +351,11 @@ uint8_t wrapper_dongle_sd_wipe() {
         return failWithCode(AppError::Code::PERMISSION_DENIED, "isso apaga TUDO do cartao SD, banco de dados incluso. Rode antes: sudo -login <senha>");
     }
 
-    if (context().peripherals == nullptr) {
-        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_wipe");
-    }
-
     if (context().espNow == nullptr) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para rebuild do banco");
     }
 
-    if (!context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
@@ -354,12 +363,12 @@ uint8_t wrapper_dongle_sd_wipe() {
         context().database->end();
     }
 
-    const bool wipeOk = context().peripherals->wipeSdContents();
+    const bool wipeOk = DongleSdCard::wipeContents();
     if (!wipeOk) {
         return failWithCode(AppError::Code::SD_WIPE_FAILED, "falha ao apagar conteudo do SD");
     }
 
-    const bool sdReinitOk = context().peripherals->beginSd(false);
+    const bool sdReinitOk = DongleSdCard::begin(false);
     if (!sdReinitOk) {
         return failWithCode(AppError::Code::SD_REINIT_FAILED, "SD limpo, mas falhou reinit");
     }
@@ -381,38 +390,46 @@ uint8_t wrapper_dongle_sd_wipe() {
 }
 
 uint8_t wrapper_dongle_sd_ls(string path = "/") {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     const string cleanPath = normalizeSdPath(path);
-    File dir = SD_MMC.open(cleanPath.c_str());
-    if (!dir || !dir.isDirectory()) {
-        if (dir) {
-            dir.close();
-        }
+    const string fsPath = toFsPath(cleanPath);
+
+    DIR* dir = ::opendir(fsPath.c_str());
+    if (dir == nullptr) {
         return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "diretorio nao encontrado: " + cleanPath);
     }
 
     printLine("[sd] listando " + cleanPath);
     size_t count = 0;
-    File entry = dir.openNextFile();
-    while (entry) {
-        char line[160] = {0};
+    struct dirent* entry = nullptr;
+    while ((entry = ::readdir(dir)) != nullptr) {
+        if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        struct stat entryStat {};
+        const string entryFsPath = fsPath + "/" + entry->d_name;
+        const bool statOk = ::stat(entryFsPath.c_str(), &entryStat) == 0;
+        const bool isDirectory = statOk && S_ISDIR(entryStat.st_mode);
+
+        // d_name can be up to 255 bytes (VFS dirent) -- size the buffer for
+        // the worst case instead of just the typical short filename.
+        char line[320] = {0};
         std::snprintf(
             line,
             sizeof(line),
             "%s %s (%lluB)",
-            entry.isDirectory() ? "[dir]" : "[file]",
-            entry.name(),
-            static_cast<unsigned long long>(entry.isDirectory() ? 0ULL : entry.size())
+            isDirectory ? "[dir]" : "[file]",
+            entry->d_name,
+            static_cast<unsigned long long>((statOk && !isDirectory) ? entryStat.st_size : 0)
         );
         printLine(line);
         ++count;
-        entry.close();
-        entry = dir.openNextFile();
     }
-    dir.close();
+    ::closedir(dir);
 
     if (count == 0) {
         printLine("[sd] (vazio)");
@@ -421,46 +438,50 @@ uint8_t wrapper_dongle_sd_ls(string path = "/") {
 }
 
 uint8_t wrapper_dongle_sd_cat(string path) {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     const string cleanPath = normalizeSdPath(path);
-    File file = SD_MMC.open(cleanPath.c_str(), FILE_READ);
-    if (!file || file.isDirectory()) {
-        if (file) {
-            file.close();
-        }
+    const string fsPath = toFsPath(cleanPath);
+
+    struct stat st {};
+    if (::stat(fsPath.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "arquivo nao encontrado: " + cleanPath);
+    }
+
+    std::FILE* file = std::fopen(fsPath.c_str(), "rb");
+    if (file == nullptr) {
         return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "arquivo nao encontrado: " + cleanPath);
     }
 
     char header[96] = {0};
-    std::snprintf(header, sizeof(header), "[sd] %s (%lluB)", cleanPath.c_str(), static_cast<unsigned long long>(file.size()));
+    std::snprintf(header, sizeof(header), "[sd] %s (%lluB)", cleanPath.c_str(), static_cast<unsigned long long>(st.st_size));
     printLine(header);
 
     constexpr size_t kMaxPrintBytes = 4096; // safety cap so a huge file doesn't flood the terminal
     size_t printed = 0;
     bool truncated = false;
-    String lineBuffer;
-    while (file.available()) {
+    string lineBuffer;
+    int ch;
+    while ((ch = std::fgetc(file)) != EOF) {
         if (printed >= kMaxPrintBytes) {
             truncated = true;
             break;
         }
 
-        const char ch = static_cast<char>(file.read());
         ++printed;
         if (ch == '\n') {
-            printLine(std::string(lineBuffer.c_str()));
-            lineBuffer = "";
+            printLine(lineBuffer);
+            lineBuffer.clear();
         } else if (ch != '\r') {
-            lineBuffer += ch;
+            lineBuffer += static_cast<char>(ch);
         }
     }
-    file.close();
+    std::fclose(file);
 
-    if (lineBuffer.length() > 0) {
-        printLine(std::string(lineBuffer.c_str()));
+    if (!lineBuffer.empty()) {
+        printLine(lineBuffer);
     }
     if (truncated) {
         printLine("[sd] ... truncado (mostrando so os primeiros 4KB) ...");
@@ -469,25 +490,22 @@ uint8_t wrapper_dongle_sd_cat(string path) {
 }
 
 uint8_t wrapper_dongle_sd_rm(string path) {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     const string cleanPath = normalizeSdPath(path);
-    if (!SD_MMC.exists(cleanPath.c_str())) {
+    const string fsPath = toFsPath(cleanPath);
+
+    struct stat st {};
+    if (::stat(fsPath.c_str(), &st) != 0) {
         return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "arquivo nao encontrado: " + cleanPath);
     }
-
-    File check = SD_MMC.open(cleanPath.c_str());
-    const bool isDirectory = check && check.isDirectory();
-    if (check) {
-        check.close();
-    }
-    if (isDirectory) {
+    if (S_ISDIR(st.st_mode)) {
         return failWithCode(AppError::Code::SD_PATH_IS_DIRECTORY, "sd_rm so remove arquivos; use dongle -sd_wipe para limpar tudo");
     }
 
-    if (!SD_MMC.remove(cleanPath.c_str())) {
+    if (std::remove(fsPath.c_str()) != 0) {
         return failWithCode(AppError::Code::SD_FILE_REMOVE_FAILED, "falha ao remover " + cleanPath);
     }
 
@@ -496,12 +514,13 @@ uint8_t wrapper_dongle_sd_rm(string path) {
 }
 
 uint8_t wrapper_dongle_sd_mkdir(string path) {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     const string cleanPath = normalizeSdPath(path);
-    if (!SD_MMC.mkdir(cleanPath.c_str())) {
+    const string fsPath = toFsPath(cleanPath);
+    if (::mkdir(fsPath.c_str(), 0775) != 0) {
         return failWithCode(AppError::Code::SD_MKDIR_FAILED, "falha ao criar diretorio " + cleanPath);
     }
 
@@ -510,21 +529,22 @@ uint8_t wrapper_dongle_sd_mkdir(string path) {
 }
 
 uint8_t writeToSdFile(const string& pathArg, const string& textArg, bool append) {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     const string cleanPath = normalizeSdPath(pathArg);
+    const string fsPath = toFsPath(cleanPath);
     const string text = stripOuterQuotes(textArg);
 
-    File file = SD_MMC.open(cleanPath.c_str(), append ? FILE_APPEND : FILE_WRITE);
-    if (!file) {
+    std::FILE* file = std::fopen(fsPath.c_str(), append ? "ab" : "wb");
+    if (file == nullptr) {
         return failWithCode(AppError::Code::SD_FILE_WRITE_FAILED, "falha ao abrir " + cleanPath + " para escrita");
     }
 
-    file.print(text.c_str());
-    file.print("\n");
-    file.close();
+    std::fwrite(text.data(), 1, text.size(), file);
+    std::fputc('\n', file);
+    std::fclose(file);
 
     printLine(string("[sd] ") + (append ? "anexado em " : "escrito em ") + cleanPath);
     return RESULT_OK;
@@ -544,9 +564,9 @@ uint8_t wrapper_dongle_history(int32_t limit = 20) {
     }
 
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
-    String output;
+    string output;
     const bool ok = context().database->readRecentCommands(boundedLimit, output);
-    printLine(output.length() > 0 ? std::string(output.c_str()) : std::string("(sem historico)"));
+    printLine(!output.empty() ? output : string("(sem historico)"));
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler historico");
     }
@@ -555,7 +575,7 @@ uint8_t wrapper_dongle_history(int32_t limit = 20) {
 }
 
 uint8_t wrapper_dongle_run_script(string path) {
-    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+    if (!DongleSdCard::isReady()) {
         return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
@@ -564,11 +584,15 @@ uint8_t wrapper_dongle_run_script(string path) {
     }
 
     const string cleanPath = normalizeSdPath(path);
-    File file = SD_MMC.open(cleanPath.c_str(), FILE_READ);
-    if (!file || file.isDirectory()) {
-        if (file) {
-            file.close();
-        }
+    const string fsPath = toFsPath(cleanPath);
+
+    struct stat st {};
+    if (::stat(fsPath.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "script nao encontrado: " + cleanPath);
+    }
+
+    std::FILE* file = std::fopen(fsPath.c_str(), "rb");
+    if (file == nullptr) {
         return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "script nao encontrado: " + cleanPath);
     }
 
@@ -576,19 +600,19 @@ uint8_t wrapper_dongle_run_script(string path) {
 
     size_t executedCount = 0;
     size_t skippedCount = 0;
-    while (file.available()) {
-        String rawLine = file.readStringUntil('\n');
-        rawLine.trim();
+    char rawLine[256];
+    while (std::fgets(rawLine, sizeof(rawLine), file) != nullptr) {
+        const string line = trimCopy(rawLine);
 
-        if (rawLine.length() == 0 || rawLine.startsWith("#")) {
+        if (line.empty() || line.front() == '#') {
             ++skippedCount;
             continue;
         }
 
-        context().shell->run_command_line(std::string(rawLine.c_str()));
+        context().shell->run_command_line(line);
         ++executedCount;
     }
-    file.close();
+    std::fclose(file);
 
     char summary[96] = {0};
     std::snprintf(
@@ -605,23 +629,35 @@ uint8_t wrapper_dongle_run_script(string path) {
 uint8_t wrapper_dongle_reboot() {
     printLine("[dongle] reiniciando...");
     delay(200); // give the serial time to flush the message before reset
-    ESP.restart();
+    esp_restart();
     return RESULT_OK; // unreachable
 }
 
 uint8_t wrapper_dongle_info() {
+    esp_chip_info_t chipInfo = {};
+    esp_chip_info(&chipInfo);
+
+    uint32_t flashBytes = 0;
+    esp_flash_get_size(nullptr, &flashBytes);
+
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char macText[18] = {0};
+    std::snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     char line[220] = {0};
     std::snprintf(
         line,
         sizeof(line),
         "[dongle] chip=%s rev=%d cores=%d heap_livre=%uB flash=%uMB uptime=%lus mac=%s",
-        ESP.getChipModel(),
-        static_cast<int>(ESP.getChipRevision()),
-        static_cast<int>(ESP.getChipCores()),
-        static_cast<unsigned>(ESP.getFreeHeap()),
-        static_cast<unsigned>(ESP.getFlashChipSize() / (1024UL * 1024UL)),
+        chipModelName(chipInfo.model),
+        static_cast<int>(chipInfo.revision),
+        static_cast<int>(chipInfo.cores),
+        static_cast<unsigned>(esp_get_free_heap_size()),
+        static_cast<unsigned>(flashBytes / (1024UL * 1024UL)),
         static_cast<unsigned long>(millis() / 1000UL),
-        WiFi.macAddress().c_str()
+        macText
     );
     printLine(line);
     return RESULT_OK;

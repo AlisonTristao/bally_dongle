@@ -4,6 +4,8 @@
 #include "SudoManager.h"
 #include "error_codes.h"
 
+#include <cstdio>
+
 namespace {
 
 using std::string;
@@ -46,9 +48,9 @@ uint8_t wrapper_database_status() {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando status");
     }
 
-    String status;
+    string status;
     const bool ok = context().database->getStatus(status);
-    printLine(status.c_str());
+    printLine(status);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao consultar status do database");
     }
@@ -61,9 +63,9 @@ uint8_t wrapper_database_tables() {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando tables");
     }
 
-    String output;
+    string output;
     const bool ok = context().database->listTables(output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao listar tabelas");
     }
@@ -76,10 +78,10 @@ uint8_t wrapper_database_read(string tableName, int32_t limit = 20) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando read");
     }
 
-    String output;
+    string output;
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
-    const bool ok = context().database->readTable(stripOuterQuotes(tableName).c_str(), boundedLimit, output);
-    printLine(output.c_str());
+    const bool ok = context().database->readTable(stripOuterQuotes(tableName), boundedLimit, output);
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler tabela");
     }
@@ -99,7 +101,7 @@ uint8_t wrapper_database_drop(string tableName) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando drop");
     }
 
-    const String safeName = String(stripOuterQuotes(tableName).c_str());
+    const string safeName = stripOuterQuotes(tableName);
     const bool ok = context().database->dropTable(safeName);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_DROP_FAILED, "falha ao remover tabela");
@@ -115,9 +117,9 @@ uint8_t wrapper_database_logs(int32_t limit = 20) {
     }
 
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
-    String output;
+    string output;
     const bool ok = context().database->readCommandLogsWithOutput(boundedLimit, output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler logs de comandos");
     }
@@ -131,9 +133,9 @@ uint8_t wrapper_database_espnow_history(int32_t limit = 30) {
     }
 
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 30U;
-    String output;
+    string output;
     const bool ok = context().database->readEspNowHistory(boundedLimit, output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler historico ESP-NOW");
     }
@@ -172,7 +174,7 @@ uint8_t wrapper_database_count(string tableName) {
 
     const string safeTableName = stripOuterQuotes(tableName);
     int32_t count = 0;
-    if (!context().database->countRows(String(safeTableName.c_str()), count)) {
+    if (!context().database->countRows(safeTableName, count)) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao contar linhas (tabela invalida?)");
     }
 
@@ -194,8 +196,8 @@ uint8_t wrapper_database_delete(string tableName, string condition) {
 
     int32_t deletedCount = 0;
     const bool ok = context().database->deleteRows(
-        String(stripOuterQuotes(tableName).c_str()),
-        String(safeCondition.c_str()),
+        stripOuterQuotes(tableName),
+        safeCondition,
         deletedCount
     );
     if (!ok) {
@@ -213,9 +215,9 @@ uint8_t wrapper_database_vacuum() {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando vacuum");
     }
 
-    String output;
+    string output;
     const bool ok = context().database->vacuum(output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao compactar banco");
     }
@@ -228,9 +230,9 @@ uint8_t wrapper_database_export(string tableName) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando export");
     }
 
-    String output;
-    const bool ok = context().database->exportTableToCsv(String(stripOuterQuotes(tableName).c_str()), output);
-    printLine(output.c_str());
+    string output;
+    const bool ok = context().database->exportTableToCsv(stripOuterQuotes(tableName), output);
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao exportar tabela");
     }
@@ -247,9 +249,9 @@ uint8_t wrapper_database_clear_logs() {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando clear_logs");
     }
 
-    String output;
+    string output;
     const bool ok = context().database->clearLogs(output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao limpar logs");
     }
@@ -262,9 +264,9 @@ uint8_t wrapper_database_backup() {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando backup");
     }
 
-    String output;
+    string output;
     const bool ok = context().database->backup(output);
-    printLine(output.c_str());
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao gerar backup do banco");
     }
@@ -281,9 +283,9 @@ uint8_t exec(string sql) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando exec");
     }
 
-    String output;
-    const bool ok = context().database->executeSql(stripOuterQuotes(sql).c_str(), output);
-    printLine(output.c_str());
+    string output;
+    const bool ok = context().database->executeSql(stripOuterQuotes(sql), output);
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao executar SQL");
     }
@@ -296,9 +298,9 @@ uint8_t execNoLog(string sql) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando exec_nolog");
     }
 
-    String output;
-    const bool ok = context().database->executeSql(stripOuterQuotes(sql).c_str(), output);
-    printLine(output.c_str());
+    string output;
+    const bool ok = context().database->executeSql(stripOuterQuotes(sql), output);
+    printLine(output);
     if (!ok) {
         return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao executar SQL");
     }

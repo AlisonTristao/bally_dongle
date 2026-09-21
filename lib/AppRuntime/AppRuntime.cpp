@@ -1,16 +1,14 @@
 #include "AppRuntime.h"
 
-#include <WiFi.h>
-#include <Esp.h>
+#include <esp_app_desc.h>
+#include <esp_chip_info.h>
+#include <esp_mac.h>
+#include <esp_ota_ops.h>
 #include <esp_random.h>
 #include <esp_system.h>
-// This is arduino-esp32 on IDF 4.4: the app descriptor lives in
-// esp_app_format.h (esp_app_desc_t) + esp_ota_ops.h (the accessor is
-// esp_ota_get_app_description(), not IDF 5.x's esp_app_get_description()).
-#include <esp_app_format.h>
-#include <esp_chip_info.h>
-#include <esp_ota_ops.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,13 +21,13 @@
 #include "EspNowConfig.h"
 #include "EspNowCommands.h"
 #include "DonglePublisher.h"
+#include "DongleSdCard.h"
 #include "ManifestCache.h"
 #include "SerialMux.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
 #include "DongleKeyStore.h"
 #include "UsbHidMux.h"
-#include <USB.h>
 
 namespace {
 
@@ -65,6 +63,19 @@ constexpr char kDongleTimezone[] = "BRT3";
 // motor driver RF noise, which a channel change cannot fix either way.
 constexpr uint8_t kEspNowChannel = 11U;
 
+std::string trimWhitespace(const std::string& text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    if (first == text.end()) {
+        return std::string();
+    }
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    return std::string(first, last);
+}
+
 // This dongle's own MANIFEST_DATA source_info block (BTP/docs/commands.md
 // 3.12), serialized once at boot and handed to ManifestCache::configure().
 // Static so its bytes outlive begin(); ManifestCache only borrows the
@@ -76,7 +87,7 @@ std::uint8_t g_dongleSourceInfo[256];
 std::size_t g_dongleSourceInfoSize = 0U;
 
 void buildDongleSourceInfo() {
-    const esp_app_desc_t* app = esp_ota_get_app_description();
+    const esp_app_desc_t* app = esp_app_get_description();
     esp_chip_info_t chip{};
     esp_chip_info(&chip);
     const esp_partition_t* running = esp_ota_get_running_partition();
@@ -97,8 +108,8 @@ void buildDongleSourceInfo() {
         if (n > 0 && cursor + n + 1 <= end) { chipRev = cursor; cursor += n + 1; }
     }
 
-    // Arduino-ESP32 leaves esp_app_desc.version a placeholder ("1"); a real
-    // git rev is injected as -DDONGLE_GIT_REV by scripts/inject_git_rev.py.
+    // Real git rev injected as -DDONGLE_GIT_REV by scripts/inject_git_rev.py;
+    // esp_app_desc.version falls back to whatever CMake/idf.py set otherwise.
 #ifdef DONGLE_GIT_REV
     const char* fwVersion = DONGLE_GIT_REV;
 #else
@@ -136,14 +147,15 @@ constexpr uint8_t kDatabaseMaxAttempts = 5U;
 // boot log pinpoints which one is responsible instead of just bracketing
 // the whole block. Compiled out unless -DDIAG_BOOT (platformio.ini) -- see
 // topico 35 D.3; a normal boot must not print a dozen heap lines.
-void logFreeHeap(const char* label) {
+void logFreeHeap(ByteIO& io, const char* label) {
 #ifdef DIAG_BOOT
     char line[64] = {0};
     std::snprintf(line, sizeof(line), "%s free_heap=%lu min_free=%lu", label,
-                  static_cast<unsigned long>(ESP.getFreeHeap()),
-                  static_cast<unsigned long>(ESP.getMinFreeHeap()));
-    ShellOutput::printTagged(Serial, "heap", line);
+                  static_cast<unsigned long>(esp_get_free_heap_size()),
+                  static_cast<unsigned long>(esp_get_minimum_free_heap_size()));
+    ShellOutput::printTagged(io, "heap", line);
 #else
+    (void) io;
     (void) label;
 #endif
 }
@@ -204,36 +216,32 @@ void AppRuntime::restoreShellHistoryFromDatabase() {
         return;
     }
 
-    String historyText;
+    std::string historyText;
     if (!databaseStore_.readRecentCommands(ShellLineEditor::DEFAULT_HISTORY_CAPACITY, historyText)) {
         return;
     }
 
-    if (historyText.isEmpty()) {
+    if (historyText.empty()) {
         return;
     }
 
-    int32_t start = 0;
-    while (start <= static_cast<int32_t>(historyText.length())) {
-        const int32_t newline = historyText.indexOf('\n', start);
-        String line;
+    size_t start = 0;
+    while (start <= historyText.size()) {
+        const size_t newline = historyText.find('\n', start);
+        std::string line = (newline == std::string::npos)
+            ? historyText.substr(start)
+            : historyText.substr(start, newline - start);
 
-        if (newline < 0) {
-            line = historyText.substring(start);
-        } else {
-            line = historyText.substring(start, newline);
-        }
-
-        line.trim();
-        if (!line.isEmpty()) {
-            serialShell_.addHistory(std::string(line.c_str()));
+        line = trimWhitespace(line);
+        if (!line.empty()) {
+            serialShell_.addHistory(line);
             // Topico 19: the BTP terminal channel has its own ShellLineEditor
             // instance (SerialMux.cpp), so persisted history has to be
             // replayed into it explicitly too.
             SerialMux::addTerminalHistory(line.c_str());
         }
 
-        if (newline < 0) {
+        if (newline == std::string::npos) {
             break;
         }
 
@@ -271,10 +279,10 @@ void AppRuntime::maybeInitDatabase() {
         ++databaseInitAttempts_;
         lastDatabaseInitMs_ = now;
 
-        if (!databaseStore_.begin(&Serial)) {
+        if (!databaseStore_.begin(console_)) {
             // DatabaseStore already logged the specific failure.
             if (databaseInitAttempts_ >= kDatabaseMaxAttempts) {
-                ShellOutput::printTagged(Serial, "database",
+                ShellOutput::printTagged(*console_, "database",
                     "init adiado desistiu -- seguindo sem persistencia");
             }
             return;
@@ -286,19 +294,22 @@ void AppRuntime::maybeInitDatabase() {
     databaseReady_ = true;
     databaseStore_.logBootEvent("power_on");
     if (!databaseStore_.loadPeers(espNowManager_)) {
-        ShellOutput::printTagged(Serial, "database",
+        ShellOutput::printTagged(*console_, "database",
             "banco aberto, mas falhou carga inicial de peers");
     }
     restoreShellHistoryFromDatabase();
-    ShellOutput::printTagged(Serial, "database", "persistencia pronta");
-    logFreeHeap("after_database_lazy"); // steady-state heap, DB now resident
+    ShellOutput::printTagged(*console_, "database", "persistencia pronta");
+    logFreeHeap(*console_, "after_database_lazy"); // steady-state heap, DB now resident
 }
 
 BaseType_t AppRuntime::selectEspNowWorkerCore() const {
 #if defined(CONFIG_FREERTOS_UNICORE) && (CONFIG_FREERTOS_UNICORE == 1)
-    return ARDUINO_RUNNING_CORE;
+    return 0;
 #else
-    return (ARDUINO_RUNNING_CORE == 0) ? 1 : 0;
+    // app_main() (and this loop) defaults to CPU0 (CONFIG_ESP_MAIN_TASK_AFFINITY);
+    // the workers go on the other core so a busy radio task never steals time
+    // from the shell/BTP loop.
+    return 1;
 #endif
 }
 
@@ -335,14 +346,14 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
         EspNowConfig::disableAsyncRx();
         // No worker means no one drains the RX queue, so onDataRecv now drops
         // (it must not process inline on the WiFi stack). Radio is deaf.
-        ShellOutput::printTagged(Serial, "espnow",
+        ShellOutput::printTagged(*console_, "espnow",
             "ALERTA rx worker nao criou (heap) -- datagramas de radio serao DESCARTADOS");
         return;
     }
 
     char rxLine[48] = {0};
     std::snprintf(rxLine, sizeof(rxLine), "rx task core=%d", static_cast<int>(workerCore));
-    ShellOutput::printTagged(Serial, "espnow", rxLine);
+    ShellOutput::printTagged(*console_, "espnow", rxLine);
 }
 
 void AppRuntime::startHeartbeatWorker() {
@@ -361,7 +372,7 @@ void AppRuntime::startHeartbeatWorker() {
     );
 
     if (heartbeatTaskOk != pdPASS) {
-        ShellOutput::printTagged(Serial, "espnow", "heartbeat task create failed");
+        ShellOutput::printTagged(*console_, "espnow", "heartbeat task create failed");
     }
 }
 
@@ -427,8 +438,8 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
     lcdDashboard_.notifyPeers(lcdPeers, lcdPeerCount, peerCount);
 
     lcdDashboard_.notifySessionStatus(SerialMux::isProtocolled(), SerialMux::isConsoleOwned());
-    lcdDashboard_.notifyStorageStatus(donglePeripherals_.isSdReady(), donglePeripherals_.sdUsedMB(),
-                                      donglePeripherals_.sdTotalMB(), databaseReady_);
+    lcdDashboard_.notifyStorageStatus(DongleSdCard::isReady(), DongleSdCard::usedMB(),
+                                      DongleSdCard::totalMB(), databaseReady_);
 
     if (!SerialMux::isConsoleOwned()) {
         return;
@@ -463,7 +474,7 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
         char line[96] = {0};
         std::snprintf(line, sizeof(line), "%s +%lu total=%lu", c.label,
                       static_cast<unsigned long>(c.delta), static_cast<unsigned long>(c.total));
-        ShellOutput::printTagged(Serial, "hub warn", line);
+        ShellOutput::printTagged(*console_, "hub warn", line);
         needPromptRefresh = true;
     }
 }
@@ -482,7 +493,7 @@ void AppRuntime::flushEditorOutput() {
     if (editorOut_.empty()) {
         return;
     }
-    Serial.write(reinterpret_cast<const uint8_t*>(editorOut_.data()), editorOut_.size());
+    console_->write(reinterpret_cast<const uint8_t*>(editorOut_.data()), editorOut_.size());
     editorOut_.clear();
 }
 
@@ -497,8 +508,8 @@ void AppRuntime::handleShellInput() {
     // Hand every byte the host typed to the editor. It buffers them and
     // echoes into editorOut_ (drained by flushEditorOutput); poll() then
     // yields whole command lines as they complete.
-    while (Serial.available() > 0) {
-        const int value = Serial.read();
+    while (console_->available() > 0) {
+        const int value = console_->read();
         if (value < 0) {
             break;
         }
@@ -527,7 +538,7 @@ void AppRuntime::handleShellInput() {
         }
 
         if (!response.empty()) {
-            ShellOutput::printResponse(Serial, response);
+            ShellOutput::printResponse(*console_, response);
         }
         serialShell_.refreshLine(editorOut_);
         flushEditorOutput();
@@ -537,45 +548,11 @@ void AppRuntime::handleShellInput() {
     flushEditorOutput();
 }
 
-void AppRuntime::begin() {
+void AppRuntime::begin(ByteIO& console) {
+    console_ = &console;
+
     setenv("TZ", kDongleTimezone, 1);
     tzset();
-
-    // Must run before the USB stack comes up (ARDUINO_USB_CDC_ON_BOOT=1
-    // starts it as soon as Serial is touched below) -- tinyusb reads these
-    // strings when building the descriptor for host enumeration.
-    USB.productName("Bally Dongle");
-    USB.manufacturerName("Bally");
-
-    BoardConfig::initBoardPins(false);
-
-    // The host can pile up several "BTP/1 ENTER" retry lines (~30 B each)
-    // while begin() runs, before the shell loop starts reading -- and a HELLO
-    // frame on top of that. The CDC's default 256-byte RX queue is tight for
-    // that; 1 KB gives margin. Must precede Serial.begin() (topico 35 C.5).
-    Serial.setRxBufferSize(1024);
-
-    #ifdef BAUDRATE
-        Serial.begin(BAUDRATE);
-    #else
-        Serial.begin();
-    #endif
-
-    // Seed the prompt text without painting -- the boot log below and the
-    // refreshLine() at the end of begin() do the first repaint.
-    serialShell_.setPrompt(std::string(ShellOutput::commandPrompt().c_str()));
-
-    // Opt-in hardening for the field: with USB auto-reset off, no DTR/RTS
-    // dance a host driver happens to perform -- deliberately or not -- can
-    // bounce the running firmware into the bootloader mid-session (the
-    // esptool reset sequence and the 1200-baud touch both go through
-    // USBCDC::reboot_enable). The cost is that `pio run -t upload` can no
-    // longer auto-enter the bootloader, so a build with this set is flashed
-    // with the BOARD's BOOT button held. Left off in the dev env on purpose;
-    // enable with -DDONGLE_USB_NO_AUTORESET for a field/demo build.
-    #ifdef DONGLE_USB_NO_AUTORESET
-        Serial.enableReboot(false);
-    #endif
 
     // Under -DDIAG_BOOT: hold long enough for the freshly reset OTG CDC to
     // re-enumerate on the host so a monitor reattaches and catches this boot's
@@ -590,15 +567,28 @@ void AppRuntime::begin() {
     {
         char line[80] = {0};
         std::snprintf(line, sizeof(line), "last_reset=%s", resetReasonText(esp_reset_reason()));
-        ShellOutput::printTagged(Serial, "boot", line);
+        ShellOutput::printTagged(*console_, "boot", line);
     }
 
-    StartupConfig::announceBoot(donglePeripherals_);
-    donglePeripherals_.beginSd(false);
+    StartupConfig::announceBoot(donglePeripherals_, *console_);
+    DongleSdCard::begin(false);
 
-    ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());
+    // BTP identity: source_id derived from this dongle's own MAC (same
+    // formula every firmware in the ecosystem uses, so it needs no
+    // handshake); boot_id is a random nonzero value for this boot only --
+    // there is no HELLO/MANIFEST yet (topico 16) to persist/announce it, and
+    // nothing here requires it to survive a reboot. esp_read_mac() reads the
+    // efuse-burned base MAC directly -- unlike esp_wifi_get_mac(), it works
+    // before the Wi-Fi driver is up (espNowManager_.begin() runs later).
+    uint8_t selfMac[6] = {0};
+    esp_read_mac(selfMac, ESP_MAC_WIFI_STA);
 
-    logFreeHeap("after_sd");
+    char macText[18] = {0};
+    std::snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
+                  selfMac[0], selfMac[1], selfMac[2], selfMac[3], selfMac[4], selfMac[5]);
+    ShellOutput::printTagged(*console_, "startup", std::string("mac=") + macText);
+
+    logFreeHeap(*console_, "after_sd");
 
     // SQLite is NOT opened here any more (topico 35 C.3). Its bootstrap SQL
     // has a 30-40KB transient page-cache/parser footprint, and running that
@@ -610,13 +600,6 @@ void AppRuntime::begin() {
     // in the boot path needs the DB: ManifestCache/hub.peers are RAM-only and
     // onDataRecv re-adds a peer on its first radio frame anyway.
 
-    // BTP identity: source_id derived from this dongle's own MAC (same
-    // formula every firmware in the ecosystem uses, so it needs no
-    // handshake); boot_id is a random nonzero value for this boot only --
-    // there is no HELLO/MANIFEST yet (topico 16) to persist/announce it, and
-    // nothing here requires it to survive a reboot.
-    uint8_t selfMac[6] = {0};
-    WiFi.macAddress(selfMac);
     uint32_t bootId = esp_random();
     if (bootId == 0) {
         bootId = 1;
@@ -651,11 +634,11 @@ void AppRuntime::begin() {
     }
     buildDongleSourceInfo();
     ManifestCache::configure(selfUuid, g_dongleSourceInfo, g_dongleSourceInfoSize);
-    SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
+    SerialMux::begin(*console_, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
     }, selfUuid, ShellOutput::commandPrompt().c_str(), selfSourceId, bootId, EspNowConfig::sendRawToMac);
 
-    logFreeHeap("after_serialmux_begin");
+    logFreeHeap(*console_, "after_serialmux_begin");
 
     // "espnow -stats" reads counters owned by two libraries that must not
     // depend on the command module (EspNowConfig.h from EspNowCommands would
@@ -768,27 +751,27 @@ void AppRuntime::begin() {
     // same composite device. No BTP framing yet -- see UsbHidMux.h.
     UsbHidMux::begin();
 
-    logFreeHeap("after_usbhidmux_begin");
+    logFreeHeap(*console_, "after_usbhidmux_begin");
 
-    EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
+    EspNowConfig::attachCallbacks(espNowManager_, *console_, &databaseStore_, &lcdDashboard_);
 
     const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(RX_ASYNC_QUEUE_DEPTH);
     if (!asyncRxEnabled) {
         // Heap starvation (topico 34/35 F2). The fallback is NOT inline
         // processing any more -- that would stack-overflow the WiFi task --
         // it is DROP: this dongle boots deaf to the radio. Loud on purpose.
-        ShellOutput::printTagged(Serial, "espnow",
+        ShellOutput::printTagged(*console_, "espnow",
             "ALERTA async RX nao subiu (heap) -- datagramas de radio serao DESCARTADOS. ver 'espnow -stats'");
     }
 
-    logFreeHeap("after_asyncrx_queue");
+    logFreeHeap(*console_, "after_asyncrx_queue");
 
     if (!espNowManager_.begin(kEspNowChannel, false)) {
-        ShellOutput::printTagged(Serial, "espnow", "init failed");
+        ShellOutput::printTagged(*console_, "espnow", "init failed");
         return;
     }
 
-    logFreeHeap("after_espnow_begin");
+    logFreeHeap(*console_, "after_espnow_begin");
 
     // Persisted peers load with the DB, from maybeInitDatabase() in tick().
     // Until then the manager runs with just the broadcast peer -- a known
@@ -799,10 +782,10 @@ void AppRuntime::begin() {
     startHeartbeatWorker();
 #else
     (void) asyncRxEnabled;
-    ShellOutput::printTagged(Serial, "boot", "DIAG: espnow rx/heartbeat workers DISABLED");
+    ShellOutput::printTagged(*console_, "boot", "DIAG: espnow rx/heartbeat workers DISABLED");
 #endif
 
-    logFreeHeap("after_workers");
+    logFreeHeap(*console_, "after_workers");
 
     const bool shellBound = ShellConfig::bind({
         &tinyShell_,
@@ -810,21 +793,21 @@ void AppRuntime::begin() {
         &donglePeripherals_,
         &lcdDashboard_,
         &databaseStore_,
-        &Serial
+        console_
     });
     if (!shellBound) {
-        ShellOutput::printTagged(Serial, "shell", "bind failed");
+        ShellOutput::printTagged(*console_, "shell", "bind failed");
         return;
     }
 
-    logFreeHeap("after_shell_bind");
+    logFreeHeap(*console_, "after_shell_bind");
 
     if (ShellConfig::registerDefaultModules() != RESULT_OK) {
-        ShellOutput::printTagged(Serial, "shell", "module registration failed");
+        ShellOutput::printTagged(*console_, "shell", "module registration failed");
         return;
     }
 
-    logFreeHeap("after_register_modules");
+    logFreeHeap(*console_, "after_register_modules");
 
     const ShellLineEditor::CompletionProvider completionProvider =
         [this](const std::string& input, std::string* outSuggestions, size_t maxSuggestions) -> size_t {
@@ -849,16 +832,16 @@ void AppRuntime::begin() {
     // terminal session (topico 19) as the real console gets.
     SerialMux::setTerminalCompletionProvider(completionProvider);
 
-    logFreeHeap("after_completion_providers");
+    logFreeHeap(*console_, "after_completion_providers");
 
     // Shell history also comes from the DB, so it too waits for
     // maybeInitDatabase() (tick()). The arrow-up buffer is simply empty for
     // the first fraction of a second of uptime.
 
-    ShellOutput::printTagged(Serial, "shell", "ready: <module> -<command> [args]");
-    ShellOutput::printTagged(Serial, "shell", "use: help -e");
+    ShellOutput::printTagged(*console_, "shell", "ready: <module> -<command> [args]");
+    ShellOutput::printTagged(*console_, "shell", "use: help -e");
 
-    logFreeHeap("after_shell_ready");
+    logFreeHeap(*console_, "after_shell_ready");
 
     serialShell_.refreshLine(editorOut_);
     flushEditorOutput();
@@ -867,10 +850,19 @@ void AppRuntime::begin() {
 void AppRuntime::tick() {
     static uint32_t lastAsyncOutputTime = 0;
     static bool pendingPromptRefresh = false;
-    
+
     bool asyncOutputOccurred = false;
 
-    maybeInitDatabase(); // opens SQLite off the boot path; no-op once up
+    // SQLite intentionally disabled (heap budget, 2026-09-21): opening it
+    // cost ~21KB of the ~21KB total free heap left after boot (see the
+    // DIAG_BOOT trace), leaving nothing for the ESP-NOW/AEAD/manifest path
+    // that actually needs headroom to connect a robot. Every DatabaseStore
+    // method already guards on isReady()/ready_ and fails closed instead of
+    // touching a null db_ handle, so every "database -*" command and every
+    // caller below (loadPeers/restoreShellHistoryFromDatabase/logBootEvent)
+    // stays safe with the store simply never begin()'ing -- re-enable by
+    // uncommenting this call, nothing else needs to change.
+    // maybeInitDatabase(); // opens SQLite off the boot path; no-op once up
     processAsyncWarnings(asyncOutputOccurred);
     flushPendingEspNowOutput(asyncOutputOccurred);
     lcdDashboard_.tick();
@@ -879,7 +871,7 @@ void AppRuntime::tick() {
     // desktop closes the COM port without completing SESSION_CLOSE (process
     // killed, cable pulled, OS error), release SerialMux immediately instead
     // of leaving it protocol-owned until the 30 s watchdog expires.
-    if (!Serial) {
+    if (!(*console_)) {
         SerialMux::onTransportLost(millis());
     }
 
@@ -906,7 +898,7 @@ void AppRuntime::tick() {
     // Nunca roda fora do console: um SerialMux protocolado e o unico dono da
     // porta (PASSO 11).
     if (pendingPromptRefresh && SerialMux::isConsoleOwned() && (millis() - lastAsyncOutputTime > 150)) {
-        Serial.println(); // Garante que o prompt inicie em uma linha limpa
+        console_->print("\r\n"); // Garante que o prompt inicie em uma linha limpa
         serialShell_.refreshLine(editorOut_);
         flushEditorOutput();
         pendingPromptRefresh = false;

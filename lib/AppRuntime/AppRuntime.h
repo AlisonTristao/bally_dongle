@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Arduino.h>
+#include "compat.h"
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -15,7 +16,11 @@
 
 class AppRuntime final {
 public:
-    void begin();
+    // console is the CDC-ACM transport (ConsoleCdc, ESP-IDF migration phase
+    // 6) the shell + BTP session run over; caller owns it and must keep it
+    // alive for as long as this AppRuntime is used. USB bring-up
+    // (UsbComposite::install() + console.begin()) must already have run.
+    void begin(ByteIO& console);
     void tick();
 
 private:
@@ -37,7 +42,10 @@ private:
     // console. No-op while SerialMux owns the port. Clears the buffer.
     void flushEditorOutput();
 
-    // The USB console's line editor. Reads bytes fed from Serial, appends
+    // The USB console transport (ConsoleCdc), injected by begin().
+    ByteIO* console_ = nullptr;
+
+    // The USB console's line editor. Reads bytes fed from console_, appends
     // everything it would echo to editorOut_ (drained by flushEditorOutput);
     // ShellLineEditor is the shared, framework-free port of the old
     // lib/ShellSerial (now in the TinyShell package).

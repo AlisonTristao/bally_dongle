@@ -38,11 +38,20 @@ DongleLcd::DongleLcd() {
         // actually shows.
         cfg.panel_width = 80;
         cfg.panel_height = 160;
-        cfg.memory_width = 80;
-        cfg.memory_height = 160;
+        // memory_width/height is the ST7735's actual addressable GRAM (132x162
+        // on every ST7735 variant, incl. MINI160x80 -- the visible glass is
+        // just a crop of it), NOT the visible panel size. Panel_LCD::setRotation
+        // needs the true GRAM size to compute the far-side offset when
+        // swapping to landscape (rotation=1, used by beginLcd()); with this
+        // equal to panel_width/height instead, that math went negative
+        // (mem - (panel + offset) underflowed) and left a blank/white band
+        // along one edge once rotated.
+        cfg.memory_width = 132;
+        cfg.memory_height = 162;
         // Same RAM col/row offsets as the old DongleSt7735::setPanelOffset()
         // call (BoardConfig::TFT_COL_START/TFT_ROW_START) -- calibrated
-        // against this specific panel, not a LovyanGFX default.
+        // against this specific panel, not a LovyanGFX default. Symmetric
+        // with the GRAM size above: 132-80-26=26, 162-160-1=1.
         cfg.offset_x = BoardConfig::TFT_COL_START;
         cfg.offset_y = BoardConfig::TFT_ROW_START;
         cfg.offset_rotation = 0;

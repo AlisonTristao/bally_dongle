@@ -109,21 +109,28 @@ uint16_t lcdColorForLine(const string& text) {
         return panelColor;
     };
 
+    // Raw RGB565, same values LcdDashboard.cpp's own kRaw* constants use
+    // (Adafruit's ST77XX_* macros no longer exist post-LovyanGFX).
+    constexpr uint16_t kRawRed = 0xF800;
+    constexpr uint16_t kRawYellow = 0xFFE0;
+    constexpr uint16_t kRawGreen = 0x07E0;
+    constexpr uint16_t kRawWhite = 0xFFFF;
+
     // Same classification the BTP terminal uses for its ANSI colours
     // (TinyShell ShellStyle), mapped onto the four panel colours -- so the LCD
     // and the terminal always agree on what a line "is".
     switch (shell_classify_line(text)) {
         case ShellMsgClass::Error:
-            return toPanelColor(ST77XX_RED);
+            return toPanelColor(kRawRed);
         case ShellMsgClass::Warning:
         case ShellMsgClass::Help:
-            return toPanelColor(ST77XX_YELLOW);
+            return toPanelColor(kRawYellow);
         case ShellMsgClass::Success:
-            return toPanelColor(ST77XX_GREEN);
+            return toPanelColor(kRawGreen);
         case ShellMsgClass::Output:
         case ShellMsgClass::Muted:
         default:
-            return toPanelColor(ST77XX_WHITE);
+            return toPanelColor(kRawWhite);
     }
 }
 
@@ -257,7 +264,7 @@ void printLine(const string& text) {
     }
 
     if (g_ctx.lcdDashboard != nullptr && g_ctx.lcdDashboard->isReady()) {
-        g_ctx.lcdDashboard->showMessage(String(normalized.c_str()), lcdColorForLine(normalized));
+        g_ctx.lcdDashboard->showMessage(normalized, lcdColorForLine(normalized));
     }
 }
 

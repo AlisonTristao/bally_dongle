@@ -1,8 +1,8 @@
 #pragma once
 
+#include "compat.h"
 #include "error_codes.h"
 
-#include <Arduino.h>
 #include <TinyShell.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
@@ -31,7 +31,7 @@ struct Context {
     DonglePeripherals* peripherals;
     LcdDashboard* lcdDashboard;
     DatabaseStore* database;
-    Stream* io;
+    ByteIO* io;
 };
 
 /**

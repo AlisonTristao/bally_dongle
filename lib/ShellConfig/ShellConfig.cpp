@@ -11,9 +11,9 @@
 
 #include <ShellStyle.h>
 
-#include <Arduino.h>
-#include <Esp.h>
 #include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <esp_system.h>
 
 #include <cstdio>
 #include <vector>
@@ -122,8 +122,8 @@ uint8_t registerDefaultModules() {
     // allocate, and `largest` vs `free_heap` says exhaustion vs fragmentation.
     // Compiled out unless -DDIAG_BOOT (platformio.ini) -- see topico 35 D.3.
     #ifdef DIAG_BOOT
-    #define DIAG_REG(stage) Serial.printf("! reg:%s free_heap=%u largest=%u\r\n", (stage), \
-        (unsigned) ESP.getFreeHeap(), (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
+    #define DIAG_REG(stage) ESP_LOGI("shell", "reg:%s free_heap=%u largest=%u", (stage), \
+        (unsigned) esp_get_free_heap_size(), (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
     #else
     #define DIAG_REG(stage) ((void) 0)
     #endif

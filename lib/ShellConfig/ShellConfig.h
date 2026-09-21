@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Arduino.h>
+#include "compat.h"
+
 #include <TinyShell.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
@@ -20,7 +21,7 @@ struct Context {
 	DonglePeripherals* peripherals;
 	LcdDashboard* lcdDashboard;
 	DatabaseStore* database;
-	Stream* io;
+	ByteIO* io;
 };
 
 /**

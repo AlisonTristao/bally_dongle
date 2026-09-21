@@ -21,7 +21,7 @@
 namespace {
 
 // Shared output stream and runtime services used by ESP-NOW callbacks.
-Stream* g_io = nullptr;
+ByteIO* g_io = nullptr;
 EspNowManager* g_manager = nullptr;
 DatabaseStore* g_database = nullptr;
 LcdDashboard* g_lcdDashboard = nullptr;
@@ -221,6 +221,8 @@ EspNowManager::TxPriority txPriorityForFrame(const uint8_t* data, size_t size) {
             return EspNowManager::TxPriority::Control;
         case btp::MessageType::Telemetry:
             return EspNowManager::TxPriority::Data;
+        case btp::MessageType::Invalid:
+            break;
     }
     return EspNowManager::TxPriority::Control;
 }
@@ -379,7 +381,7 @@ bool enqueueRouted(QueueHandle_t queue, const ProtocolRouter::RoutedMessage& rou
         return false;
     }
     if (routed.payloadSize > kQueuedPayloadCap) {
-        ++g_droppedQueueFullTotal;
+        g_droppedQueueFullTotal = g_droppedQueueFullTotal + 1;
         return false;
     }
 
@@ -394,7 +396,7 @@ bool enqueueRouted(QueueHandle_t queue, const ProtocolRouter::RoutedMessage& rou
         return true;
     }
 
-    ++g_droppedQueueFullTotal;
+    g_droppedQueueFullTotal = g_droppedQueueFullTotal + 1;
     return false;
 }
 
@@ -552,11 +554,11 @@ void handleRoutedCommand(const uint8_t mac[6], const ProtocolRouter::RoutedMessa
 // and would otherwise be the one type with no ingress number.
 void countRouted(btp::MessageType type) {
     switch (type) {
-        case btp::MessageType::Telemetry: ++g_routedTelemetryTotal; break;
-        case btp::MessageType::Log:       ++g_routedLogTotal; break;
-        case btp::MessageType::Command:   ++g_routedCommandTotal; break;
-        case btp::MessageType::Control:   ++g_routedControlTotal; break;
-        case btp::MessageType::Terminal:  ++g_routedTerminalTotal; break;
+        case btp::MessageType::Telemetry: g_routedTelemetryTotal = g_routedTelemetryTotal + 1; break;
+        case btp::MessageType::Log:       g_routedLogTotal = g_routedLogTotal + 1; break;
+        case btp::MessageType::Command:   g_routedCommandTotal = g_routedCommandTotal + 1; break;
+        case btp::MessageType::Control:   g_routedControlTotal = g_routedControlTotal + 1; break;
+        case btp::MessageType::Terminal:  g_routedTerminalTotal = g_routedTerminalTotal + 1; break;
         case btp::MessageType::Invalid:
         default: break;
     }
@@ -663,14 +665,14 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
         g_lcdDashboard->notifyRx();
     }
 
-    ++g_rxDatagramTotal;
+    g_rxDatagramTotal = g_rxDatagramTotal + 1;
 
     const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(data, len);
     if (ingress.error != btp::Error::Ok) {
         if (ingress.error == btp::Error::CrcMismatch) {
-            ++g_droppedCrcTotal;
+            g_droppedCrcTotal = g_droppedCrcTotal + 1;
         } else {
-            ++g_droppedDecodeTotal;
+            g_droppedDecodeTotal = g_droppedDecodeTotal + 1;
         }
         return;
     }
@@ -686,7 +688,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
 
     const std::uint32_t nowMs = millis();
     if (ingress.mayConsume && !retainPendingRelay(ingress.header, data, len, nowMs)) {
-        ++g_droppedReassemblyTotal;
+        g_droppedReassemblyTotal = g_droppedReassemblyTotal + 1;
         return;
     }
 
@@ -697,22 +699,22 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
 
     switch (outcome) {
         case ProtocolRouter::Outcome::DroppedDecode:
-            ++g_droppedDecodeTotal;
+            g_droppedDecodeTotal = g_droppedDecodeTotal + 1;
             return;
         case ProtocolRouter::Outcome::DroppedCrc:
-            ++g_droppedCrcTotal;
+            g_droppedCrcTotal = g_droppedCrcTotal + 1;
             return;
         case ProtocolRouter::Outcome::DroppedReassembly:
             if (ingress.mayConsume) {
                 clearPendingRelay(ingress.header);
             }
-            ++g_droppedReassemblyTotal;
+            g_droppedReassemblyTotal = g_droppedReassemblyTotal + 1;
             return;
         case ProtocolRouter::Outcome::FragmentAccepted:
             // Not a loss and not yet a message: counted on its own so the
             // ratio datagrams/routed can be read as "how much of the traffic
             // is fragmentation overhead" instead of looking like a leak.
-            ++g_fragmentAcceptedTotal;
+            g_fragmentAcceptedTotal = g_fragmentAcceptedTotal + 1;
             return;
         case ProtocolRouter::Outcome::DroppedInvalidArgument:
         case ProtocolRouter::Outcome::DuplicateFragment:
@@ -735,7 +737,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             if (SerialMux::isProtocolled()) {
                 if ((ingress.header.flags & btp::kFlagFragmented) != 0U) {
                     if (!relayPendingUp(routed.header)) {
-                        ++g_droppedReassemblyTotal;
+                        g_droppedReassemblyTotal = g_droppedReassemblyTotal + 1;
                     }
                 } else {
                     countRouted(ingress.header.type);
@@ -744,7 +746,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             }
             if (ingress.header.type == btp::MessageType::Control &&
                 ingress.header.object_id == bally::kStatusObjectId) {
-                ++g_droppedAuthTotal;
+                g_droppedAuthTotal = g_droppedAuthTotal + 1;
             }
             return;
         }
@@ -813,7 +815,7 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len, int8_t rssi
             return;
         }
 
-        ++g_droppedRxTotal;
+        g_droppedRxTotal = g_droppedRxTotal + 1;
         return;
     }
 
@@ -823,7 +825,7 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len, int8_t rssi
     // the channel-C AEAD work -- it would overflow and panic on the first
     // datagram, which is the "reboots on boot when a robot is nearby" loop.
     // Drop and count so the dongle stays up long enough to diagnose the heap.
-    ++g_syncFallbackDropTotal;
+    g_syncFallbackDropTotal = g_syncFallbackDropTotal + 1;
 }
 
 void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -893,7 +895,7 @@ void handleTerminalItem(const QueuedRoutedMessage&) {}
 
 namespace EspNowConfig {
 
-void attachCallbacks(EspNowManager& manager, Stream& io, DatabaseStore* database, LcdDashboard* lcdDashboard) {
+void attachCallbacks(EspNowManager& manager, ByteIO& io, DatabaseStore* database, LcdDashboard* lcdDashboard) {
     g_io = &io;
     g_manager = &manager;
     g_database = database;

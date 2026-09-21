@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Arduino.h>
+#include "compat.h"
 #include <EspNowManager.h>
 #include <DatabaseStore.h>
 #include <ProtocolRouter.h>
@@ -72,7 +72,7 @@ struct RxDatagramEvent {
 
 void attachCallbacks(
 	EspNowManager& manager,
-	Stream& io,
+	ByteIO& io,
 	DatabaseStore* database = nullptr,
 	LcdDashboard* lcdDashboard = nullptr
 );
