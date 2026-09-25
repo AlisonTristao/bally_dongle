@@ -10,3 +10,6 @@ __pycache__
 # managed_components/.
 /managed_components/
 /build/
+
+# Planos temporarios locais (removidos ao concluir, nunca versionados)
+PLANO_TEMP_*.txt
