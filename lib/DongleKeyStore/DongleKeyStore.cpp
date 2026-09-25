@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #elif defined(ESP_PLATFORM)
 #include <nvs.h>
+#include <nvs_flash.h>
 #endif
 
 namespace DongleKeyStore {
@@ -326,14 +327,28 @@ bool loadFromNvs() noexcept {
 // ESP-IDF migration, phase 4 (PLANO_ESPIDF_DONGLE.md): Arduino's Preferences
 // is itself just a thin wrapper over exactly these nvs_* calls (same
 // namespace/key-as-blob model) -- this is a direct, same-shape port, not a
-// redesign. Requires nvs_flash_init() to already have run once (today: as a
-// side effect of EspNowManager::begin(), phase 3); nvs_open() fails closed
-// with ESP_ERR_NVS_NOT_INITIALIZED otherwise, which saveToNvs()/loadFromNvs()
-// below already treat as an ordinary failure.
+// redesign. Unlike Preferences, raw nvs_open() needs nvs_flash_init() to
+// have run first -- and AppRuntime::begin() calls loadFromNvs() long before
+// EspNowManager::begin() does that init, so relying on it made every boot
+// fail with ESP_ERR_NVS_NOT_INITIALIZED and the operator had to retype the
+// password. ensureNvsReady() inits it here; nvs_flash_init() returns ESP_OK
+// on an already-initialized partition, so EspNowManager's later call stays
+// a no-op.
 
 namespace {
 constexpr const char* kNvsNamespace = "ballykey";
 constexpr const char* kNvsKeyName = "key_l";
+
+// Same recovery policy as EspNowManager::begin(): an NVS partition that is
+// full or from a newer format is erased and re-initialized.
+bool ensureNvsReady() noexcept {
+    esp_err_t result = nvs_flash_init();
+    if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        result = nvs_flash_init();
+    }
+    return result == ESP_OK;
+}
 }  // namespace
 
 bool saveToNvs() noexcept {
@@ -342,7 +357,7 @@ bool saveToNvs() noexcept {
     }
 
     nvs_handle_t handle = 0;
-    if (nvs_open(kNvsNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+    if (!ensureNvsReady() || nvs_open(kNvsNamespace, NVS_READWRITE, &handle) != ESP_OK) {
         return false;
     }
 
@@ -354,7 +369,7 @@ bool saveToNvs() noexcept {
 
 bool loadFromNvs() noexcept {
     nvs_handle_t handle = 0;
-    if (nvs_open(kNvsNamespace, NVS_READONLY, &handle) != ESP_OK) {
+    if (!ensureNvsReady() || nvs_open(kNvsNamespace, NVS_READONLY, &handle) != ESP_OK) {
         return false;
     }
 

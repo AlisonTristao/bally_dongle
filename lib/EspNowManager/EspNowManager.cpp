@@ -368,10 +368,10 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     // phase 3), replacing what arduino-esp32's WiFi.mode(WIFI_STA)/
     // WiFi.disconnect() used to do under the hood. Mirrors bally_OS's own
     // ROBOT::configureCommunication() (BallyRobot.cpp) -- the Wi-Fi driver
-    // needs NVS for calibration data before esp_wifi_init() will succeed,
-    // and this dongle has no earlier boot step that already did that (phase
-    // 4/DongleKeyStore's own nvs_flash_init() becomes a harmless no-op once
-    // this one already ran).
+    // needs NVS for calibration data before esp_wifi_init() will succeed.
+    // DongleKeyStore::loadFromNvs() already inits it earlier in boot, so this
+    // call is normally a no-op -- kept so begin() does not depend on that
+    // ordering.
     esp_err_t nvsResult = nvs_flash_init();
     if (nvsResult == ESP_ERR_NVS_NO_FREE_PAGES || nvsResult == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
