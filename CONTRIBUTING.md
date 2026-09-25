@@ -9,9 +9,11 @@ comandos existentes.
 
 ## 1. Princípios gerais
 
-- **Sem abstração prematura.** Um comando novo não precisa de uma classe nova; três
-  `if`/wrappers parecidos são melhores que uma abstração genérica pra "qualquer comando
-  futuro". Só extraia um helper quando o padrão já se repetiu de verdade.
+- **Sem abstração prematura.** Um comando novo não precisa de uma classe nova.
+  Extraia componentes para delimitar responsabilidades reais e compartilhe código que
+  represente a mesma regra. Semelhança visual não basta; regras duplicadas de protocolo
+  ou ciclo de vida também não se justificam por evitar abstrações. Não projete extensões
+  para transportes ou comandos hipotéticos.
 - **Sem comentário do óbvio.** Comentário só quando explica um *porquê* não óbvio (uma
   quirk de hardware, uma decisão de segurança, um workaround de bug específico — ex.: o
   comentário sobre `toPanelColor` no LCD, ou o do `CONFIRMAR`/`sudo` sendo guarda-corpo vs.
@@ -30,7 +32,7 @@ comandos existentes.
   parser de linguagem: falso positivo pontual (ex.: palavra nova fora da lista) é esperado
   às vezes — ajuste as listas `ENGLISH_MARKERS`/`PORTUGUESE_MARKERS` no script quando isso
   acontecer, não contorne o comando novo.
-- **Build limpo é obrigatório antes de considerar uma mudança pronta**:
+- **Build limpo é obrigatório antes de considerar uma mudança de código pronta**:
   ```bash
   platformio run -e tdongle-s3
   platformio test -e native
@@ -39,6 +41,8 @@ comandos existentes.
   `components/esp32-idf-sqlite3`/`components/lovyangfx` upstream, silenciados via
   `-Wno-error=*` nos `CMakeLists.txt` desses componentes, não contam). O segundo comando
   também roda `check_user_text.py` (seção 1) e os testes host-native (ver README.md § 10).
+  Mudanças exclusivamente documentais exigem revisão do diff, links e coerência das
+  regras, sem build de firmware.
 
 ## 2. Padrão de "módulo de comando"
 
@@ -97,24 +101,22 @@ uint8_t registerAll() {
 
 ## 3. Arquitetura e camadas
 
-O grafo de dependências entre libs foi auditado nesta revisão: **é um DAG, sem nenhum
-ciclo real** (nenhum par onde A inclui B e B inclui A de volta, nem direto nem via `.cpp`).
-Isso importa porque o LDF do PlatformIO (modo chain) tem uma falha conhecida: dependência
-circular entre duas libs quebra a resolução transitiva de headers; dependência
-unidirecional — mesmo em cadeia longa (`AppRuntime → EspNowConfig → ShellConfig →
-ShellCommandSupport → DatabaseStore → EspNowManager`) — funciona sem problema. **Antes de
-adicionar um novo `#include` entre libs, confirme que a lib alvo (no `.h` e no `.cpp`) não
-inclui de volta, nem transitivamente, a lib de origem.** Um `grep` rápido pelos includes já
-resolve a dúvida.
+O objetivo é ter dependências mínimas, explícitas e direcionais. **Não introduza ciclos
+entre módulos**, incluindo dependências nos `.cpp`. Antes de adicionar um include,
+verifique se o alvo já depende, direta ou transitivamente, da origem. Não trate uma
+auditoria antiga como garantia do grafo atual. Bibliotecas não devem depender de
+`AppRuntime` para descobrir serviços ou estado.
 
 Quando duas libs em ramos diferentes do DAG (ex.: `EspNowConfig` e `EspNowCommands`)
 precisam da mesma capacidade de uma lib de baixo nível (ex.: enviar bytes via
 `EspNowManager`), e essa lib de baixo nível não pode saber quem está chamando: prefira um
 callback de função (`BtpTransport::SendFn`) em vez de incluir a lib de topo direto — foi o
 padrão usado para `BtpTransport` não incluir `EspNowManager.h` (ver README.md § 3), o que
-também mantém `BtpTransport`/`ProtocolRouter` portáveis pro `env:native` (sem Arduino).
+também mantém `BtpTransport`/`ProtocolRouter` portáveis pro `env:native` (sem ESP-IDF).
+Callbacks devem expor operações específicas, com contexto de execução e possibilidade
+de reentrada definidos; não servem para esconder acesso ao objeto de aplicação inteiro.
 
-Camadas atuais (de cima pra baixo, cada uma só depende das de baixo):
+Responsabilidades da composição e do shell (não é um mapa completo de comunicação):
 
 1. **`AppRuntime`** — único dono dos objetos runtime (`EspNowManager`, `DatabaseStore`,
    `DonglePeripherals`, `LcdDashboard`, `TinyShell`, `ShellLineEditor`); monta tudo no `begin()`.
@@ -139,6 +141,56 @@ livres sobre um `static`/global interno) — está correto um módulo de comando
 direto (`#include "SudoManager.h"`) em vez de forçá-los para dentro do `Context`. Regra
 prática: se o serviço é "um objeto que o `AppRuntime` cria e configura uma vez", ele entra
 no `Context`; se é "um utilitário de processo, tipo uma função global", inclui direto.
+
+Essa regra é restrita aos adaptadores do shell. Serviços de domínio recebem somente as
+dependências necessárias e não acessam `ShellCommandSupport::context()`. Novos globais
+mutáveis não devem ser introduzidos como atalho para passar dependências.
+
+### Composição central e responsabilidades
+
+`AppRuntime` permanece dono e coordenador central: monta componentes, conecta callbacks
+e coordena inicialização, operação e recuperação. Pode conhecer todos os subsistemas;
+cada subsistema mantém seu próprio estado, suas invariantes e detalhes de implementação.
+
+- Métodos de coordenação mostram **quando os componentes colaboram**, em um nível
+  coerente de detalhe. Implementar **como um subsistema funciona** cabe ao seu dono,
+  mesmo quando esse comportamento usa várias bibliotecas.
+- Descreva o propósito de cada módulo em uma frase. Nomes como `Manager`, `Config` ou
+  `Support` não justificam acumular funções que mudam por motivos independentes.
+- Transporte e multiplexação cuidam de bytes, enquadramento, filas e sessão. Handlers
+  de comandos, manifesto e assinaturas têm responsabilidades próprias. Shell e rádio
+  adaptam entradas para operações da aplicação, sem duplicar regras equivalentes.
+- Use constantes, IDs e codecs canônicos do BTP; não copie offsets ou reconstrua
+  formatos já implementados. Destinos de publicação devem ser considerados de maneira
+  consistente por envio, contagem, taxa e limpeza, evitando listas paralelas.
+- Uma operação pública deve expressar a intenção, como encerrar uma sessão. Seu dono
+  garante a ordem de limpar filas, invalidar referências e liberar recursos, sem exigir
+  que o chamador manipule seus campos internos.
+- Separe parsing, decisão e execução quando forem etapas distintas. Sessões e
+  inicialização com várias fases precisam de estados e transições definidos, incluindo
+  falha, timeout, fila cheia, desconexão e repetição. Falhas parciais precisam de
+  recuperação ou estado degradado explícito antes de continuar a operação.
+- Não crie classes para cada grupo de funções nem interfaces genéricas sem necessidade.
+  Separar um arquivo grande em vários ajuda a navegar, mas não isola estado por si só.
+
+### Estado, concorrência e recursos
+
+- Declare quem cria, modifica e destrói cada recurso, quais tarefas/ISRs podem acessá-lo
+  e qual mecanismo protege esse acesso: fila, mutex, seção crítica ou protocolo com atomics.
+  Prefira um único responsável pelas mudanças de estado quando isso simplificar o fluxo.
+- Não aceite corrida "tolerada", `volatile` ou "cabe em uma palavra" como justificativa
+  suficiente. Campos que formam um estado coerente precisam de proteção conjunta.
+  ISRs usam mecanismos adequados ao contexto, como APIs `FromISR` ou atomics cuja
+  implementação seja comprovadamente adequada à ISR; não usam mutex bloqueante.
+- Referências emprestadas precisam de validade explícita. Zerar um ponteiro, torná-lo
+  atômico ou conferir uma geração não mantém o objeto vivo entre a checagem e o uso.
+  Desconexão e destruição devem coordenar leitores e operações em andamento.
+- Use guardas RAII para mutexes adquiridos e recursos temporários: erros e retornos
+  antecipados devem liberá-los automaticamente. Evite locks durante I/O demorado ou
+  callbacks externos sem contrato explícito de bloqueio e ordem dos locks.
+- Filas e buffers têm capacidade e comportamento em saturação definidos. Ao ampliar
+  payloads, considere o custo multiplicado por filas e sessões, a stack e a margem de
+  heap necessária à operação. Não reserve memória para casos hipotéticos sem necessidade.
 
 ## 4. Códigos de erro (`include/error_codes.h`)
 
@@ -181,3 +233,28 @@ ter referências antigas.
 - Build limpo (seção 1) antes de qualquer commit.
 - Mensagem de commit em português, curta, focada no "porquê" — mesmo estilo do histórico
   atual (`git log`).
+
+## 7. Evolução e revisão
+
+- Aplique estas regras incrementalmente: não amplie a dívida na área alterada e corrija
+  os limites necessários à mudança. Não exija uma reescrita geral nem um limite arbitrário
+  de linhas por arquivo. Tamanho é um sinal para revisão; responsabilidade é o critério.
+- Em extrações, preserve comportamento e distribuição de tarefas. Mudanças de timing,
+  prioridade ou protocolo devem ser explícitas e verificadas separadamente.
+- Comentários descrevem contratos atuais, unidades, limites e decisões não óbvias.
+  Histórico de migração pertence ao Git ou a documentos de decisões. Ao substituir um
+  fluxo, revise chamadores, testes e documentação e remova os caminhos realmente obsoletos.
+- Teste o comportamento afetado, inclusive conexões entre componentes: assinatura →
+  geração → envio, conexão → uso → desconexão e erro → recuperação. Novos transportes
+  devem passar pelos mesmos cenários compartilhados, além de seus casos específicos.
+- Builds e testes nativos não comprovam timing, consumo máximo de memória ou operação
+  de hardware. Quando afetados, registre a validação em placa ou o que ficou pendente.
+
+Checklist antes de concluir uma alteração:
+
+- Está claro onde o comportamento pertence e quais dependências utiliza?
+- Foi criada dependência escondida, ciclo ou regra duplicada?
+- Quem possui o estado e garante sua validade entre tarefas?
+- O fluxo de falha, saturação e desconexão está definido?
+- O teste verifica o comportamento necessário, incluindo a integração alterada?
+- Comentários e documentação correspondem ao resultado final?
