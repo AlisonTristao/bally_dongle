@@ -18,7 +18,9 @@
 # [env:native] builds through `symlink://../BTP` -- so the firmware and the
 # host test suite can never diverge on the protocol.
 #
-# Minimum revision: v2.45.0 -- the tag [env:tdongle-s3] already pins today.
+# Minimum revision: v2.46.0 -- keeps this dongle in step with bally_OS, whose
+# keyed nodes drop unsealed messages from 2.46.0 on. No NodeConfig here has
+# has_open(), so this dongle's own receive behavior is unchanged by it.
 # ManifestCache/ProtocolRouter/SerialSession/BtpTransport already consume
 # btp::receiver/session/endpoint (see the btp-session-statemachine and
 # btp-node-consumer-migration memory notes); this component just makes those
